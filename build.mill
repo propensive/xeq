@@ -1,0 +1,369 @@
+//| mill-version: 1.1.5
+//| mill-jvm-version: temurin:25
+//| mill-jvm-opts: ["-XX:NonProfiledCodeHeapSize=250m", "-XX:ReservedCodeCacheSize=500m"]
+
+package build
+
+import mill.*
+import scalalib.*
+import publish.*
+
+object settings:
+  // The Scala compiler is the propensive/proscala fork. XEQ reads Soundness's TASTy, which that
+  // compiler produced, so it must compile with the same one. The mechanism is ported from the
+  // Soundness build: `proscala.downloadRelease` fetches the release tarball into the *shared*
+  // `~/.cache/soundness/proscala/<tag>` cache — so a release fetched by either build serves both
+  // — and `proscala.repo` republishes its unversioned jars as a Maven-layout repository view.
+  //
+  // NOTE these `sys.env` overrides do NOT work under the Mill daemon: the value is read when the
+  // build script is evaluated, and neither a fresh daemon nor `--no-daemon` propagates the
+  // variable. To switch toolchains, edit the defaults here.
+  val scalaVersion = sys.env.getOrElse("SOUNDNESS_SCALA_VERSION", "3.9.0-p16")
+  val scalaRelease = sys.env.getOrElse("SOUNDNESS_SCALA_RELEASE", "3.9.0-p16")
+
+  // Empty by default → download `scalaRelease`. Set to a local `make`-built `release` directory
+  // to use its `release/lib` jars directly (fork-developer mode).
+  val scalaHome = sys.env.getOrElse("SOUNDNESS_SCALA_HOME", "")
+
+  // The Soundness release XEQ's Scala modules are compiled against. Soundness publishes one
+  // GitHub release per version whose assets are the individual component jars, each embedding
+  // its own POM; `make sync-releases VERSION=X.Y.Z` in a Soundness checkout installs a release
+  // into `~/.ivy2/local`, from which coursier resolves these coordinates with no repository
+  // configuration. Component jars carry no `_3` suffix, hence the single-colon `mvn"…"`.
+  //
+  // This is a dependency on Soundness's *libraries*, in one direction only. Nothing in Soundness
+  // depends on XEQ, and nothing here depends on `ethereal`, the daemon: the two halves of an XEQ
+  // executable meet at `spec/`, not at a coordinate.
+  val soundnessVersion = "0.65.0"
+
+  // The version XEQ's own jars are published under.
+  val xeqVersion = sys.env.getOrElse("XEQ_VERSION", "0.1.0")
+
+  val scalaOptions = Seq(
+    // The fork's opt-in behaviours, enabled by name, exactly as the Soundness build enables
+    // them: XEQ's sources were written for that dialect and read TASTy produced by it.
+    "-Zalias-captures",
+    "-Zdiagnostic-givens",
+    "-Zgiven-prefixes",
+    "-Zinline-source-maps",
+    "-Zopaque-mutability",
+    "-Zpure-iarrays",
+    "-Zretains-bounds",
+    "-Zretains-skolems",
+    "-Zspreadable-varargs",
+    "-Zunboxed-pure-types",
+    "-Zunion-captures",
+    "-experimental",
+    "-new-syntax",
+    "-feature",
+    "-preview",
+    "-deprecation",
+    "-Wunused:imports",
+    "-Wimplausible-patterns",
+    "-Xmax-inlines", "32",
+    "-Yno-flexible-types",
+    "-Yexplicit-nulls",
+    "-Ycheck-all-patmat",
+    "-language:experimental.modularity",
+    "-language:experimental.dependent",
+    "-language:experimental.relaxedLambdaSyntax",
+    "-language:experimental.genericNumberLiterals",
+    "-language:experimental.into",
+    "-language:experimental.erasedDefinitions",
+    "-language:implicitConversions",
+    "-language:experimental.saferExceptions",
+    "-language:experimental.strictEqualityPatternMatching",
+    "-language:experimental.subCases",
+    "-language:experimental.multiSpreads")
+
+  // Capture checking, and capture plus separation checking. Soundness rolls these out
+  // module-by-module and each module here compiles under exactly the tier its sources were
+  // written and checked under in Soundness: the script generator and the packager under `sep`,
+  // the toolchain edge (which passes a capturing `edit` function through `Toolchain.Setting`,
+  // and implements a `Tool` whose signature is not capture-annotated) under neither.
+  def cc(options: Seq[String]): Seq[String] =
+    options ++ Seq("-Ycc-new", "-language:experimental.captureChecking")
+
+  def sep(options: Seq[String]): Seq[String] =
+    cc(options) :+ "-language:experimental.separationChecking"
+
+  // XEQ's sources are written for the proscenium predef (the Soundness house predef), so the
+  // build replicates `-Yno-predef -Yimports:…`. `scala` is deliberately NOT imported: the
+  // blessed collections are proscenium's opaque `List`/`Set`/`Map`/`Array`, and naming both
+  // packages would make every such reference ambiguous.
+  val predef = Seq("-Yno-predef", "-Yimports:java.lang,proscenium")
+
+  // Every Soundness component XEQ's modules reach directly. Each jar's embedded POM names its
+  // own dependencies, so the rest of the surface arrives transitively.
+  object soundness:
+    val v = soundnessVersion
+
+    // `xeq.core`: reading templates off the classpath, base64, gzip, files and streams.
+    val core = Seq(
+      mvn"dev.propensive:hellenism-core:$v",     // classpath resources (`cp"…"`)
+      mvn"dev.propensive:monotonous-core:$v",    // Base64 serialization
+      mvn"dev.propensive:turbulence-core:$v",    // streams
+      mvn"dev.propensive:pneumatic-flate:$v",    // Gzip
+      mvn"dev.propensive:galilei-jvm:$v")        // paths and files
+
+    // `xeq.packager`: hashing, downloading and assembling stubs.
+    val packager = Seq(
+      mvn"dev.propensive:gastronomy-core:$v",    // SHA-256 of a downloaded stub
+      mvn"dev.propensive:telekinesis-jvm:$v",    // HTTP
+      mvn"dev.propensive:urticose-url:$v",       // URLs
+      mvn"dev.propensive:eucalyptus-core:$v",    // logging
+      mvn"dev.propensive:zeppelin-core:$v",      // ZIP surgery for the appended JAR
+      mvn"dev.propensive:guillotine-core:$v",    // `codesign` on macOS
+      mvn"dev.propensive:ambience-core:$v")      // environment and system properties
+
+    // `xeq.toolchain`: the `Jar` → executable edge of an Anthology toolchain.
+    val toolchain = Seq(
+      mvn"dev.propensive:anthology-linker:$v",   // Jar, Toolchain, Edge, Tool
+      mvn"dev.propensive:parasite-core:$v")      // Monitor
+
+    // `xeq.test`.
+    val test = Seq(
+      mvn"dev.propensive:probably-cli:$v",       // Suite
+      mvn"dev.propensive:probably-events:$v",    // the BinTEL event stream a host runner reads
+      mvn"dev.propensive:spectacular-core:$v",   // `show`
+      mvn"dev.propensive:escapade-core:$v",      // Teletype
+      mvn"dev.propensive:profanity-core:$v",     // termcaps
+      mvn"dev.propensive:digression-ansi:$v",    // stack-trace diagnostics
+      mvn"dev.propensive:inimitable-core:$v")    // Uuid, for scratch filenames
+
+    // `xeq.example`: the end-to-end fixture, and the ONLY place the daemon appears. It is not a
+    // dependency of any published XEQ artifact — see the module's comment.
+    val example = Seq(
+      mvn"dev.propensive:ethereal-core:$v",
+      mvn"dev.propensive:exoskeleton-completions:$v")
+
+// Downloads and extracts the `settings.scalaRelease` tarball from propensive/proscala into a
+// *shared* cache dir outside the Mill `out/` tree — the same cache the Soundness build uses, so a
+// release fetched by either build is reused by the other. Each release is a single
+// `proscala-<tag>.tar.gz` asset carrying a `lib/` directory of jars, extracted into `<tag>/lib`. A
+// `.complete` sentinel makes a fully-populated cache a no-op — no network, no GitHub API call.
+object proscala extends Module:
+  def downloadRelease(tag: String): os.Path =
+    val root = os.home / ".cache" / "soundness" / "proscala" / tag
+    val lib = root / "lib"
+    val sentinel = lib / ".complete"
+    if os.exists(sentinel) then lib else
+      os.makeDir.all(root)
+      val api = s"https://api.github.com/repos/propensive/proscala/releases/tags/$tag"
+      val json = ujson.read(os.proc("curl", "-fsSL", api).call().out.text())
+      val asset = json("assets").arr.find(_("name").str.endsWith(".tar.gz")).getOrElse:
+        throw new Exception(s"no .tar.gz asset on proscala release $tag")
+      val name = asset("name").str
+      val url = asset("browser_download_url").str
+      val tarball = root / name
+      if !os.exists(tarball) then os.proc("curl", "-fsSL", "-o", tarball.toString, url).call()
+
+      // Verify against the published digest when the API supplies one ("sha256:<hex>").
+      asset.obj.get("digest").flatMap(_.strOpt).foreach: digest =>
+        if digest.startsWith("sha256:") then
+          val md = java.security.MessageDigest.getInstance("SHA-256")
+          val hex = md.digest(os.read.bytes(tarball)).map("%02x".format(_)).mkString
+          if hex != digest.stripPrefix("sha256:") then
+            os.remove(tarball)
+            throw new Exception(s"checksum mismatch for $name (expected $digest, got sha256:$hex)")
+
+      os.remove.all(lib)
+      os.proc("tar", "-xzf", tarball.toString, "-C", root.toString).call()
+      os.remove(tarball) // reclaim ~43 MB; the sentinel guards against re-fetching
+      os.write(sentinel, "")
+      lib
+
+  // Content-fingerprints the fork's jars so a rebuilt or re-released compiler regenerates the
+  // repository. `SOUNDNESS_SCALA_HOME` (if set) points at a local `release`; otherwise the
+  // `settings.scalaRelease` assets are downloaded and cached.
+  def distribution: T[PathRef] = Task.Input:
+    if settings.scalaHome.nonEmpty then PathRef(os.Path(settings.scalaHome) / "lib")
+    else PathRef(downloadRelease(settings.scalaRelease))
+
+  def repo: T[PathRef] = Task:
+    val lib = distribution().path
+    val v = settings.scalaVersion
+    val sl = "org.scala-lang"
+
+    // (group, artifactId, jar filename in release/lib, dependencies as (group, id, version))
+    val artifacts = Seq(
+      (sl, "proscala-library_3", "proscala-library.jar", Seq()),
+      (sl, "scala-library", "scala-library.jar", Seq((sl, "proscala-library_3", v))),
+      (sl, "scala3-library_3", "scala3-library.jar", Seq((sl, "scala-library", v))),
+      (sl, "scala3-interfaces", "scala3-interfaces.jar", Seq()),
+      (sl, "tasty-core_3", "tasty-core.jar", Seq((sl, "scala-library", v))),
+      (sl, "scala3-compiler_3", "scala3-compiler.jar", Seq(
+        (sl, "scala3-interfaces", v),
+        (sl, "tasty-core_3", v),
+        (sl, "scala3-library_3", v),
+        ("org.scala-lang.modules", "scala-asm", "9.9.0-scala-1"),
+        ("org.scala-sbt", "compiler-interface", "1.12.0"),
+        ("org.scala-sbt", "util-interface", "1.11.5"))),
+      (sl, "scala3-repl_3", "scala3-repl.jar", Seq(
+        (sl, "scala3-compiler_3", v),
+        ("org.jline", "jline-reader", "4.0.14"),
+        ("org.jline", "jline-terminal", "4.0.14"),
+        ("org.jline", "jline-terminal-jni", "4.0.14"),
+        ("io.get-coursier", "interface", "1.0.29-M4"),
+        ("org.virtuslab", "using_directives", "1.1.4"),
+        ("com.lihaoyi", "pprint_3", "0.9.3"))),
+      (sl, "scala3-sbt-bridge", "scala3-sbt-bridge.jar", Seq(
+        (sl, "scala3-compiler_3", v),
+        (sl, "scala3-repl_3", v))),
+      (sl, "scala3-staging_3", "scala3-staging.jar", Seq((sl, "scala3-compiler_3", v))),
+      (sl, "scala3-tasty-inspector_3", "scala3-tasty-inspector.jar", Seq(
+        (sl, "scala3-compiler_3", v))))
+
+    artifacts.map: (group, id, jar, dependencies) =>
+      val dir = Task.dest / os.SubPath(group.replace('.', '/')) / id / v
+      os.makeDir.all(dir)
+      os.copy(lib / jar, dir / s"$id-$v.jar", replaceExisting = true)
+
+      val deps = dependencies.map: (dGroup, dId, dVersion) =>
+        s"<dependency><groupId>$dGroup</groupId><artifactId>$dId</artifactId>" +
+          s"<version>$dVersion</version></dependency>"
+      . mkString
+
+      os.write.over(dir / s"$id-$v.pom",
+        s"""<?xml version="1.0" encoding="UTF-8"?>
+           |<project xmlns="http://maven.apache.org/POM/4.0.0">
+           |  <modelVersion>4.0.0</modelVersion>
+           |  <groupId>$group</groupId>
+           |  <artifactId>$id</artifactId>
+           |  <version>$v</version>
+           |  <dependencies>$deps</dependencies>
+           |</project>
+           |""".stripMargin)
+
+    PathRef(Task.dest)
+
+// Routes a Scala module through the fork toolchain: the repository view above for all coursier
+// resolutions, plus direct (content-hashed) paths for the two hot artifacts — the compiler
+// classpath and the compiled sbt bridge — so a rebuilt compiler is picked up without any
+// version-string ceremony.
+trait Forked extends ScalaModule:
+  override def repositories: T[Seq[String]] = Task:
+    super.repositories() :+ s"file://${proscala.repo().path}"
+
+  // Soundness's own POMs pin the fork toolchain at the version Soundness was built with. The
+  // synthetic repository above only ever contains `settings.scalaVersion`, and no fork version
+  // exists on Central, so any pin that differs from ours is unresolvable. Forcing them all to
+  // `settings.scalaVersion` is what lets XEQ be built by a compiler from a *different* proscala
+  // stream than the one that produced the Soundness jars.
+  override def depManagement: T[Seq[Dep]] = Task:
+    super.depManagement() ++ Seq(
+      mvn"org.scala-lang:proscala-library_3:${settings.scalaVersion}",
+      mvn"org.scala-lang:scala-library:${settings.scalaVersion}",
+      mvn"org.scala-lang:scala3-library_3:${settings.scalaVersion}",
+      mvn"org.scala-lang:scala3-interfaces:${settings.scalaVersion}",
+      mvn"org.scala-lang:tasty-core_3:${settings.scalaVersion}",
+      mvn"org.scala-lang:scala3-compiler_3:${settings.scalaVersion}",
+      mvn"org.scala-lang:scala3-staging_3:${settings.scalaVersion}",
+      mvn"org.scala-lang:scala3-tasty-inspector_3:${settings.scalaVersion}")
+
+  override def scalaCompilerClasspath: T[Seq[PathRef]] = Task:
+    // The fork-built jars come from the repository view because Zinc locates the standard library
+    // within this classpath BY FILENAME (`scala-library-<version>*.jar`), and the distribution's
+    // own filenames are unversioned. The compiler's third-party runtime dependencies are not
+    // shipped in the release, so they are resolved from the ordinary repositories.
+    val versioned = os.walk(proscala.repo().path).filter(_.ext == "jar").map(PathRef(_))
+
+    val thirdParty = defaultResolver().classpath(Seq(
+      mvn"org.scala-lang.modules:scala-asm:9.9.0-scala-1",
+      mvn"org.scala-sbt:compiler-interface:1.12.0",
+      mvn"org.scala-sbt:util-interface:1.11.5"))
+
+    versioned ++ thirdParty
+
+  override def scalaCompilerBridge: T[Option[PathRef]] = Task:
+    Some(PathRef(proscala.distribution().path / "scala3-sbt-bridge.jar"))
+
+// One module per source directory under `src`, with its resources under `res/<module>`, mirroring
+// the Soundness layout the sources came from.
+trait Component(dependencies: PublishModule*) extends Forked, PublishModule:
+  override def scalaVersion = settings.scalaVersion
+  override def scalacOptions = settings.scalaOptions ++ settings.predef
+  def moduleId: String = moduleDir.last
+  override def moduleDeps: Seq[PublishModule] = dependencies
+  override def sources = Task.Sources(moduleDir)
+  // `res/<module>` is both a runtime resource root and a *compile* resource root: hellenism's
+  // `cp"…"` interpolator resolves a classpath path at compile time, so a template the generator
+  // reads must be visible to the compiler, not merely packaged into the jar.
+  override def resources = Task.Sources(moduleDir / os.up / os.up / "res" / moduleId)
+  override def compileResources = Task.Sources(moduleDir / os.up / os.up / "res" / moduleId)
+
+  // The beneficence compiler plugin writes the `META-INF/givens/<typeclass>` and
+  // `META-INF/services/probably.Suite` index entries Soundness's runtime and test discovery read.
+  override def scalacPluginMvnDeps = Seq(
+    mvn"dev.propensive:beneficence-plugin:${settings.soundnessVersion}"
+      .exclude("org.scala-lang" -> "scala-library"))
+
+  // Those indexes are *fragments* of a build-wide index, one per contributing module. Mill's
+  // default assembly rules are last-one-wins, which silently truncates them; concatenate instead,
+  // exactly as the Soundness build does. Every fragment ends with a newline, so the empty
+  // separator is correct.
+  override def assemblyRules = super.assemblyRules ++ Seq(
+    mill.javalib.Assembly.Rule.AppendPattern("META-INF/givens/.*"),
+    mill.javalib.Assembly.Rule.AppendPattern("META-INF/services/.*"))
+
+  def publishVersion = settings.xeqVersion
+  def artifactSuffix = Task("")
+
+  def pomSettings = Task(PomSettings(
+    description = "XEQ: JVM applications as single executable files",
+    organization = "dev.propensive",
+    url = "https://github.com/propensive/xeq/",
+    licenses = Seq(License.`Apache-2.0`),
+    versionControl = VersionControl.github("propensive", "xeq"),
+    developers = Seq(Developer("propensive", "Jon Pretty", "https://github.com/propensive"))))
+
+  override def artifactName = Task(s"xeq-$moduleId")
+
+object xeq extends Module:
+  override def moduleDir = super.moduleDir / os.up / "src"
+
+  // The polyglot script generator: turns payloads and asset tables into a single file that is
+  // simultaneously a valid `sh` script, a `.bat` file and a PowerShell script, which unpacks or
+  // downloads the executable for the platform it finds itself on and replaces itself with it.
+  object core extends Component():
+    def mvnDeps = settings.soundness.core
+    override def scalacOptions = settings.sep(super.scalacOptions())
+
+  // Turning a `Packaging` into a distributable: obtain each platform's bare stub (locally or by
+  // verified download), patch its `ETHRCFG` block, append the application JAR, and wrap the
+  // result in a polyglot script where the delivery calls for one.
+  object packager extends Component(core):
+    def mvnDeps = settings.soundness.packager
+    override def scalacOptions = settings.sep(super.scalacOptions())
+
+  // The same packaging reached as an Anthology toolchain format, so an application can be
+  // compiled and packaged in one path rather than packaged as a separate step afterwards.
+  object toolchain extends Component(core, packager):
+    def mvnDeps = settings.soundness.toolchain
+
+  // Suites have no `main` of their own: a host runner discovers them from the
+  // `META-INF/services/probably.Suite` index the beneficence plugin writes, and drives them
+  // over the BinTEL test-event protocol. `make test` assembles this module and runs
+  // `fume run -c …` over the assembly, exactly as Soundness runs its own suites.
+  object test extends Component(core, packager, toolchain):
+    def mvnDeps = settings.soundness.test
+    override def artifactName = Task("xeq-test")
+    override def scalacOptions = settings.sep(super.scalacOptions())
+
+  // The end-to-end fixture: a real daemonized application, packaged by the modules above and run
+  // through a real runner stub. This is the ONE module that depends on a daemon implementation
+  // (Soundness's `ethereal`), because the other end of the protocol has to be *something* for an
+  // end-to-end test to exist. It is deliberately outside every aggregate — nothing published
+  // from this repository depends on it, and `mill xeq.core.compile` and the test suite never
+  // resolve it. `make e2e` is what builds it.
+  object example extends Component():
+    def mvnDeps = settings.soundness.example
+    override def artifactName = Task("xeq-example")
+    def finalMainClass = "xeq.hello"
+
+  // Everything published from this repository. Note the absence of `example`.
+  def all = Task:
+    core.compile()
+    packager.compile()
+    toolchain.compile()
+    test.compile()

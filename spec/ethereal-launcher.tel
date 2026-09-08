@@ -1,0 +1,74 @@
+name ethereal-launcher
+
+document
+  select Message required
+
+select Message
+  variant init Init
+  variant stderr Stderr
+  variant control Control
+  variant signal Signal
+  variant exit Exit
+  variant verify Verify
+  variant signal-ack SignalAck
+  variant verdict Verdict
+  variant mode Mode
+  variant exit-status ExitStatus
+
+record Init
+  description
+      A new invocation: the connection then carries the client's
+      stdin to the daemon and the daemon's stdout to the client.
+  field pid String required
+  field uid String required
+  field username String required
+  field script String required
+  field pwd String required
+  field tty Flag optional
+  field argument String optional repeatable
+  field environment String optional repeatable
+
+record Stderr
+  description
+      The connection on which the invocation's stderr is delivered.
+  field pid String required
+
+record Control
+  description
+      The connection on which the daemon sends mode documents.
+  field pid String required
+
+record Signal
+  description
+      A signal the client received, named without its SIG prefix.
+  field pid String required
+  field name String required
+
+record Exit
+  description
+      A request for the invocation's exit status, sent after its
+      streams have drained; answered with an exit-status document.
+  field pid String required
+
+record Verify
+  description
+      Asks whether the launcher file the daemon started from still
+      has the content it remembers; answered with a verdict.
+  field launcher String optional
+
+record SignalAck
+  description
+      Whether the invocation accepted a forwarded signal.
+  field accept Flag optional
+
+record Verdict
+  field fresh Flag optional
+
+record Mode
+  description
+      Asks the launcher to put the client's terminal into canonical
+      (cooked) mode, or back into raw mode when the flag is absent.
+  field canonical Flag optional
+
+record ExitStatus
+  field code String required

@@ -1,0 +1,17 @@
+# Mill
+out/
+.bsp/
+.bloop/
+.metals/
+
+# Cargo
+target/
+
+# Build outputs: runner stubs and packaged executables, neither of which is source
+dist/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store

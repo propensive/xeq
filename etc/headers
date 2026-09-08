@@ -1,0 +1,13 @@
+#!/bin/bash
+#
+# Refresh the licence header at the top of every Scala source, stamping it with the most recent
+# tag. The header runs from the top of the file to the line before `package`.
+
+export VERSION=$(git describe --tags $(git rev-list --tags --max-count 1) 2>/dev/null || echo "0.1.0")
+echo "Setting version to $VERSION"
+for FILE in src/*/*.scala
+do
+  echo "Updating header in $FILE"
+  envsubst < etc/header.txt > .tmpfile
+  sed '/^package/,$!d' "${FILE}" >> .tmpfile && mv .tmpfile "${FILE}"
+done
