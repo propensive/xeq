@@ -7,10 +7,11 @@
 ┃                                 ╭──╯   ╰──╮│   ╭────╯│   │ │   │                                 ┃
 ┃                                 │   ╭─╮   ││   ╰────╮│   ╰─╯   │                                 ┃
 ┃                                 ╰───╯ ╰───╯╰────────╯╰─────╮   │                                 ┃
-┃                                                            │   │                                 ┃
-┃                                                            ╰───╯                                 ┃
-┃    XEQ, version 0.1.0.                                                                           ┃
-┃    © Copyright 2021-25 Jon Pretty, Propensive OÜ.                                                ┃
+┃                                                            │   ╰╮                                ┃
+┃                                                            ╰────╯                                ┃
+┃                                                                                                  ┃
+┃    Cross-build Executable Quickstart, version ${VERSION}.                                        ┃
+┃    © Copyright 2021-26 Jon Pretty, Propensive OÜ.                                                ┃
 ┃                                                                                                  ┃
 ┃    The primary distribution site is:                                                             ┃
 ┃                                                                                                  ┃
