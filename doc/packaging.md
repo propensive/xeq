@@ -4,8 +4,9 @@
 
 Shipping a JVM application to someone who just wants to run it starts with distribution: a JAR
 becomes a self-contained executable — a native launcher per platform, or a single polyglot
-installer script that runs as shell script, batch file and PowerShell alike. That is what XEQ
-does.
+installer script that runs as shell script, batch file and PowerShell alike. Building one is
+joining a bare runner stub, a 3764-byte configuration record and the JAR (`stub ‖ record ‖
+jar`); the reference implementation is the `xeq` script published with each runner release.
 
 ### On distribution
 
@@ -81,9 +82,11 @@ against its committed manifest; `Packaging.RunnerSource.Local` reads prebuilt st
 directory instead — the output of `make runners-build` or `make runners-fetch` — which is what
 the test suite and `make e2e` use.
 
-The stubs are not built by the Scala build and are never stored in a jar. They are published on
-their own cadence by `make runners-release`, which also rewrites the resources the packager
-reads, so adopting a new runner is a data change.
+The stubs and the `xeq` builder script are not built by the Scala build and are never stored in a
+jar. They are published together on their own cadence by `make runners-release`, which also
+rewrites the resources the packager reads, so adopting a new runner is a data change. `Packager`
+locates the script from the `XEQ` environment variable or `dist/xeq`, and shells out to it — the
+one implementation of the byte format, shared with anyone building from a plain shell.
 
 ### The other end
 

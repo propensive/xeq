@@ -43,9 +43,12 @@ OUT=dist/hello
 mkdir -p dist
 rm -f "$OUT"
 
-# Package with the toolchain's own packager, from the local stubs: `Native` delivery, one
-# platform, no download and no hash check.
-./mill -i xeq.packager.runMain xeq.Package "$PWD/$JAR" "$PWD/$OUT" "$LABEL" "$PWD/dist/runners"
+# Package with the published builder script, from the local stubs: `Native` delivery, one
+# platform, no download and no hash check. This is the same `xeq build` a shell user runs.
+if [[ ! -x dist/xeq ]]; then
+  echo "e2e: dist/xeq not found — run \`make xeq-script\`" >&2; exit 1
+fi
+./dist/xeq build --jar "$PWD/$JAR" --out "$PWD/$OUT" --target "$LABEL" --runners "$PWD/dist/runners"
 
 echo "e2e: running $OUT"
 ACTUAL=$("$OUT")

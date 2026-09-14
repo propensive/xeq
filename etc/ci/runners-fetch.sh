@@ -15,7 +15,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 VERSION="${1:-}"
 REPO="${2:-propensive/xeq}"
-TAG="runners-$VERSION"
+TAG="xeq-$VERSION"
 MANIFEST="etc/runners/$VERSION.tsv"
 
 if [[ -z "$VERSION" ]]; then

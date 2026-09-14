@@ -61,196 +61,134 @@ import workingDirectories.javaBaseWorkingDirectory
 import logging.silentLogging
 import stdios.fileDescriptorStdio
 import termcaps.environmentTermcap
-
 import strategies.throwUnsafely
 import charEncoders.utf8Encoder
-import providers.javaBaseProvider
+import charDecoders.utf8Decoder
 import alphabets.hexLowerCase
+import providers.javaBaseProvider
+import textSanitizers.skipSanitizer
 import errorDiagnostics.stackTracesDiagnostics
-
 import filesystemOptions.deleteRecursively
-
 import filesystemBackends.javaBaseFilesystem
-import denominative.dysasymptotics.linearSize
 
+// The suite drives the published `xeq` builder script (dist/xeq — build it with
+// `make xeq-script`) rather than any in-JVM assembler: the script is the single implementation
+// of the ETHRCFG v3 format (spec/ethrcfg.md). `Packager` is a thin front end over it, tested
+// here through the same shell-out an Anthology build uses. Suites that need real stubs
+// (dist/runners) or a Windows host skip cleanly when those are absent.
 object Tests extends Suite(m"XEQ tests"):
   def run(): Unit =
     val tempDirs = scala.collection.mutable.ListBuffer.empty[Path on Linux]
 
     def tempDir(): Path on Linux =
-      val name: Text = Uuid().show
-      val dir: Path on Linux = temporaryDirectory[Path on Linux] / name
+      val dir: Path on Linux = temporaryDirectory[Path on Linux]/Uuid().show
       dir.create[Directory]()
       tempDirs += dir
       dir
 
-    try runTestsBody(tempDir) finally tempDirs.each: dir =>
-      safely(dir.delete())
+    try body(tempDir) finally tempDirs.each { dir => safely(dir.delete()) }
 
-  private def runTestsBody(tempDir: () -> Path on Linux): Unit =
+  private def body(tempDir: () -> Path on Linux): Unit =
+    val here: Path on Linux = workingDirectory
+    val script: Path on Linux =
+      safely(Environment.xeq[Text].as[Path on Linux]).or(unsafely(t"${here.encode}/dist/xeq".as[Path on Linux]))
+
+    val hostLabel: Text = sh"uname -s".exec[Text]().trim match
+      case t"Darwin" => sh"uname -m".exec[Text]().trim match
+        case t"arm64" | t"aarch64" => t"macos-arm64"
+        case _                     => t"macos-x64"
+      case _ => sh"uname -m".exec[Text]().trim match
+        case t"aarch64" | t"arm64" => t"linux-arm64"
+        case _                     => t"linux-x64"
+
     val labels: List[Text] = List(t"linux-x64", t"linux-arm64", t"macos-x64", t"macos-arm64")
+    val scriptOk: Boolean = script.existent()
 
-    val payloads: proscenium.List[Payload] = proscenium.List.from:
-      labels.stdlib.map: (label: Text) =>
-        val src = t"#!/bin/sh\necho 'hello from $label'\n"
-        Payload(label, src.in[Data], gzip = true)
+    // Hash and size via the shell — the suite's business is the script's output bytes, not
+    // galilei's capture-checked streaming. (`wc -c FILE`, not `< FILE`: guillotine execs
+    // directly, so a `<` would be a literal argument.)
+    def sha(path: Path on Linux): Text =
+      sh"shasum -a 256 ${path.encode}".exec[Text]().cut(t" ").prim.or(t"")
+    def size(path: Path on Linux): Text =
+      sh"wc -c ${path.encode}".exec[Text]().trim.cut(t" ").prim.or(t"")
 
-    val bundleBytes: Data = Xeq.installer(payloads)
+    def writeText(path: Path on Linux, text: Text): Unit =
+      path.open[File](Write, OpenFlag.Create, OpenFlag.Truncate)(file.write(Chain(text.in[Data])))
 
-    def stage(): (Path on Linux, Path on Linux) =
+    // Path with a computed Text segment (avoids the Admissible ambiguity of `dir / textValue`).
+    def sub(dir: Path on Linux, name: Text): Path on Linux =
+      unsafely(t"${dir.encode}/$name".as[Path on Linux])
+    def stubOf(dir: Path on Linux, label: Text): Path on Linux =
+      sub(dir, if label.starts(t"windows") then t"runner-${label}.exe" else t"runner-$label")
+
+    // A directory of fake "stubs": shell scripts that echo and exit before the appended record
+    // and JAR are ever reached, so the whole chain runs with no daemon and no real runner.
+    def fakeRunners(): Path on Linux =
       val dir = tempDir()
-      val script = dir / t"hello"
-      script.create[File]()
-      script.open[File](Write): handle ?=>
-        handle.write(Chain(bundleBytes))
-      script.executable() = true
-      (dir, script)
+      labels.each: label =>
+        val stub = stubOf(dir, label)
+        val content: Text = t"#!/bin/sh\necho ran-"+label+t"\nexit 0\n"
+        writeText(stub, content)
+        sh"chmod +x ${stub.encode}".exec[Exit]()
+      dir
 
-    // `docker info` (unlike `docker --version`) contacts the daemon, so the container tests
-    // skip when the daemon is unreachable rather than failing.
-    val dockerOk = safely(sh"docker info".exec[Exit]()) == Exit.Ok
+    def fakeJar(dir: Path on Linux): Path on Linux =
+      val jar = dir/t"app.jar"; writeText(jar, t"JARBYTES\n"); jar
 
-    val hostLabel = sh"uname -m".exec[Text]().trim match
-      case t"arm64" | t"aarch64" => t"macos-arm64"
-      case _                     => t"macos-x64"
+    if !scriptOk then
+      Out.println(t"dist/xeq not found; run `make xeq-script` — skipping builder tests")
+    else
+      suite(m"record"):
+        test(m"is exactly 3764 bytes and starts with the v3 magic"):
+          val dir = tempDir(); val rec = dir/t"rec"
+          sh"$script record --out $rec --build-id 42".exec[Exit]()
+          (size(rec), sh"head -c 7 ${rec.encode}".exec[Text]().trim)
+        .assert(_ == (t"3764", t"ETHRCFG"))
 
-    suite(m"bundle()"):
-      test(m"output starts with bash shebang"):
-        bundleBytes.utf8.starts(t"#!/usr/bin/env bash")
-      .assert(_ == true)
+      suite(m"build (native)"):
+        test(m"output equals stub \u2016 record \u2016 jar, byte for byte"):
+          val dir = tempDir(); val runners = fakeRunners(); val jar = fakeJar(dir)
+          val out = dir/t"tool"; val rec = dir/t"rec"
+          sh"$script build --jar $jar --out $out --target $hostLabel --runners $runners".exec[Exit]()
+          sh"$script record --out $rec --target $hostLabel".exec[Exit]()
+          val stub = stubOf(runners, hostLabel)
+          val cat = dir/t"cat"
+          sh"sh -c ${t"cat '${stub.encode}' '${rec.encode}' '${jar.encode}' > '${cat.encode}'"}".exec[Exit]()
+          sha(out) == sha(cat)
+        .assert(_ == true)
 
-      test(m"index line contains every label"):
-        val text = bundleBytes.utf8
-        labels.all: label =>
-          text.contains(t"$label=")
-      .assert(_ == true)
+      suite(m"embed-all"):
+        test(m"unpacks to a runnable binary that selects the host payload"):
+          val dir = tempDir(); val runners = fakeRunners(); val jar = fakeJar(dir); val out = dir/t"tool"
+          sh"$script embed-all --jar $jar --out $out --runners $runners".exec[Exit]()
+          sh"$out".exec[Text]().trim
+        .assert(_ == t"ran-$hostLabel")
 
-    suite(m"native macOS exec"):
-      test(m"selects host platform payload"):
-        val (_, script) = stage()
-        sh"$script".exec[Text]().trim
-      .assert(_ == t"hello from $hostLabel")
+      suite(m"download (online launcher)"):
+        test(m"fetches the stub over file://, appends record and jar, runs"):
+          val dir = tempDir(); val runners = fakeRunners(); val jar = fakeJar(dir); val out = dir/t"tool"
+          val manifest = dir/t"m.tsv"
+          val body = labels.map { l => t"$l\t${sha(stubOf(runners, l))}" }.join(t"\n")
+          writeText(manifest, t"$body\n")
+          sh"$script download --jar $jar --out $out --runners-url file://${runners.encode} --runners-manifest $manifest".exec[Exit]()
+          sh"$out".exec[Text]().trim
+        .assert(_ == t"ran-"+hostLabel)
 
-    def stageDownloader(jar: Data, entries: List[(Text, Text, Text)]): Path on Linux =
-      val dir = tempDir()
-      val script = dir / t"fetch"
-      script.create[File]()
-      script.open[File](Write): handle ?=>
-        handle.write(Chain(Xeq.onlineLauncher(jar, entries)))
-      script.executable() = true
-      script
+      suite(m"dispatch"):
+        test(m"downloads a complete executable and re-execs it"):
+          val dir = tempDir()
+          val exe = dir/t"real"
+          val exeBody: Text = t"#!/bin/sh\necho dispatched\nexit 0\n"
+          writeText(exe, exeBody)
+          sh"chmod +x ${exe.encode}".exec[Exit]()
+          val manifest = dir/t"d.tsv"
+          writeText(manifest, t"$hostLabel\tfile://${exe.encode}\t${sha(exe)}\n")
+          val out = dir/t"tool"
+          sh"$script dispatch --out $out --manifest $manifest".exec[Exit]()
+          sh"$out".exec[Text]().trim
+        .assert(_ == t"dispatched")
 
-    // Serve the binaries as `file://` URLs so the generated downloader's curl
-    // path is exercised without standing up an HTTP server.
-    def fileEntry(dir: Path on Linux, label: Text, body: Text, hash: Optional[Text] = Unset)
-    :   (Text, Text, Text) =
-      val bin = dir / t"bin-$label"
-      bin.create[File]()
-      val bytes = body.in[Data]
-      bin.open[File](Write): handle ?=>
-        handle.write(Chain(bytes))
-      (label, t"file://$bin", hash.or(bytes.digest[Sha2[256]].serialize[Hex]))
-
-    suite(m"onlineLauncher()"):
-      val entries: proscenium.List[(Text, Text, Text)] =
-        labels.map(fileEntry(tempDir(), _, t"#!/bin/sh\n"))
-      val script: Data = Xeq.onlineLauncher(t"JAR".in[Data], entries)
-
-      test(m"output starts with bash shebang"):
-        script.utf8.starts(t"#!/usr/bin/env bash")
-      .assert(_ == true)
-
-      test(m"assets line contains every label"):
-        val text = script.utf8
-        labels.all { label => text.contains(t"$label=") }
-      .assert(_ == true)
-
-      test(m"embeds the JAR once as the data payload"):
-        script.utf8.contains(t"index:data=1")
-      .assert(_ == true)
-
-    def stageDispatcher(entries: List[(Text, Text, Text)]): Path on Linux =
-      val dir = tempDir()
-      val script = dir / t"dispatch"
-      script.create[File]()
-      script.open[File](Write): handle ?=>
-        handle.write(Chain(Xeq.dispatcher(entries)))
-      script.executable() = true
-      script
-
-    suite(m"dispatcher()"):
-      val entries: proscenium.List[(Text, Text, Text)] =
-        labels.map(fileEntry(tempDir(), _, t"#!/bin/sh\n"))
-      val script: Data = Xeq.dispatcher(entries)
-
-      test(m"output starts with bash shebang"):
-        script.utf8.starts(t"#!/usr/bin/env bash")
-      .assert(_ == true)
-
-      test(m"assets line contains every label"):
-        val text = script.utf8
-        labels.all { label => text.contains(t"$label=") }
-      .assert(_ == true)
-
-      test(m"embeds no payload at all"):
-        script.utf8.contains(t"index:")
-      .assert(_ == false)
-
-      // The downloaded "executable" reports its arguments, so this exercises the whole
-      // contract at once: platform selection, download, verification, self-replacement and
-      // re-invocation with the original arguments.
-      test(m"downloads, verifies, replaces itself and re-invokes with arguments"):
-        val dir = tempDir()
-        val entries: proscenium.List[(Text, Text, Text)] = proscenium.List.from:
-          labels.stdlib.map: (label: Text) =>
-            fileEntry(dir, label, t"#!/bin/sh\necho \"ran $label $$@\"\nexit 0\n")
-        val dispatch = stageDispatcher(entries)
-        sh"$dispatch --flag operand".exec[Text]().trim
-      .assert(_ == t"ran $hostLabel --flag operand")
-
-      test(m"after the first run, the script has become the executable"):
-        val dir = tempDir()
-        val entries: proscenium.List[(Text, Text, Text)] = proscenium.List.from:
-          labels.stdlib.map: (label: Text) =>
-            fileEntry(dir, label, t"#!/bin/sh\necho again\n")
-        val dispatch = stageDispatcher(entries)
-        sh"$dispatch".exec[Text]()
-        sh"$dispatch".exec[Text]().trim
-      .assert(_ == t"again")
-
-      test(m"rejects an executable whose hash does not match"):
-        val dir = tempDir()
-        val badHash = t"0"*64
-        val entries: proscenium.List[(Text, Text, Text)] = proscenium.List.from:
-          labels.stdlib.map: (label: Text) =>
-            fileEntry(dir, label, t"#!/bin/sh\necho oops\n", badHash)
-        val dispatch = stageDispatcher(entries)
-        sh"$dispatch".exec[Exit]()
-      .assert(_ != Exit.Ok)
-
-    suite(m"native macOS download"):
-      // The "stub" served here exits before the appended JAR bytes are reached, so the
-      // launcher's download → verify → append-embedded-JAR → exec path runs end-to-end.
-      test(m"downloads, verifies, assembles and runs host binary"):
-        val dir = tempDir()
-        val entries: proscenium.List[(Text, Text, Text)] = proscenium.List.from:
-          labels.stdlib.map: (label: Text) =>
-            fileEntry(dir, label, t"#!/bin/sh\necho 'fetched $label'\nexit 0\n")
-        sh"${stageDownloader(t"JAR".in[Data], entries)}".exec[Text]().trim
-      .assert(_ == t"fetched $hostLabel")
-
-      test(m"rejects a binary whose hash does not match"):
-        val dir = tempDir()
-        val badHash = t"0"*64
-        val entries: proscenium.List[(Text, Text, Text)] = proscenium.List.from:
-          labels.stdlib.map: (label: Text) =>
-            fileEntry(dir, label, t"#!/bin/sh\necho oops\nexit 0\n", badHash)
-        sh"${stageDownloader(t"JAR".in[Data], entries)}".exec[Exit]()
-      .assert(_ != Exit.Ok)
-
-    suite(m"Packager validation"):
-      // These configurations are rejected before any assembly or I/O happens, so
-      // the (non-existent) jar paths are never touched.
+      // Packager is a thin front end over the same script.
       def config
          (delivery:     Packaging.Delivery,
           dependencies: Packaging.Dependencies,
@@ -258,176 +196,48 @@ object Tests extends Suite(m"XEQ tests"):
           targets:      List[Text]             = List(t"linux-x64"))
       :   Packaging =
         val dir = tempDir()
-        Packaging
-         (name         = t"hello",
-          targets      = targets,
-          delivery     = delivery,
-          dependencies = dependencies,
-          output       = dir/t"hello",
-          runnerSource = runnerSource)
+        Packaging(name = t"hello", targets = targets, delivery = delivery, dependencies = dependencies,
+                  output = dir/t"hello", runnerSource = runnerSource)
 
       val fatJar: Packaging.Dependencies = Packaging.Dependencies.FatJar(tempDir()/t"app.jar")
 
-      test(m"Burdock remote dependencies are rejected"):
-        val dependencies = Packaging.Dependencies.BurdockRemote(tempDir()/t"app.jar")
-        capture[Packager.Error](Packager.pack(config(Packaging.Delivery.EmbedAll, dependencies)))
-      .assert(_ => true)
+      suite(m"Packager validation"):
+        test(m"Burdock remote dependencies are rejected"):
+          capture[Packager.Error](Packager.pack(config(Packaging.Delivery.EmbedAll,
+            Packaging.Dependencies.BurdockRemote(tempDir()/t"app.jar"))))
+        .assert(_ => true)
 
-      test(m"remote runner with no hash for the target is rejected"):
-        // Fails on the missing-hash check before any download is attempted.
-        val remote = Packaging.RunnerSource.Remote(t"https://example.invalid/", Map())
-        capture[Packager.Error]:
-          Packager.pack(config(Packaging.Delivery.Native, fatJar, remote))
-      .assert(_ => true)
+        test(m"remote runner with no hash for the target is rejected"):
+          capture[Packager.Error](Packager.pack(config(Packaging.Delivery.Native, fatJar,
+            Packaging.RunnerSource.Remote(t"https://example.invalid/", Map()))))
+        .assert(_ => true)
 
-      test(m"native delivery with multiple targets is rejected"):
-        capture[Packager.Error]:
-          Packager.pack(config(Packaging.Delivery.Native, fatJar, targets = labels))
-      .assert(_ => true)
+        test(m"native delivery with multiple targets is rejected"):
+          capture[Packager.Error]:
+            Packager.pack(config(Packaging.Delivery.Native, fatJar, targets = List(t"linux-x64", t"macos-arm64")))
+        .assert(_ => true)
 
-    suite(m"Packager assembly (offline, local stubs)"):
-      // A fake bare stub carrying the ETHRCFG marker so `Assembler.patch` can patch it,
-      // followed by enough zero bytes for the 24-byte metadata and public-key regions.
-      def writeStub(dir: Path on Linux, label: Text): Unit =
-        val file: Path on Linux = t"$dir/runner-$label".as[Path on Linux]
+      suite(m"Packager assembly via the script"):
+        test(m"Native delivery builds a byte-correct host binary"):
+          val dir = tempDir(); val runners = fakeRunners()
+          val jar = dir/t"app.jar"; writeText(jar, t"JARBYTES\n")
+          val out = dir/t"hello"
+          Packager.pack(Packaging(name = t"hello", targets = List(hostLabel),
+            delivery = Packaging.Delivery.Native, dependencies = Packaging.Dependencies.FatJar(jar),
+            output = out, runnerSource = Packaging.RunnerSource.Local(runners)))
+          sh"$out".exec[Text]().trim
+        .assert(_ == t"ran-$hostLabel")
 
-        val bytes: scala.Array[Byte] =
-          scala.Array.fill(64)(0.toByte)
-          ++ Assembler.MagicMarker
-          ++ scala.Array.fill(64 + Assembler.PublicKeyLength)(0.toByte)
-
-        file.create[File]()
-        file.open[File](Write) { h ?=> h.write(Chain(Array.unsafeFrozen(bytes): Data)) }
-
-      test(m"EmbedAll bundles the JAR once and every patched stub"):
-        val dir: Path on Linux = tempDir()
-        labels.each(writeStub(dir, _))
-
-        val jar: Path on Linux = dir/t"app.jar"
-        jar.create[File]()
-        jar.open[File](Write) { h ?=> h.write(Chain(t"JARBYTES".in[Data])) }
-
-        val out: Path on Linux = dir/t"hello"
-
-        val packaging: Packaging =
-          Packaging
-            ( name         = t"hello",
-              targets      = labels,
-              delivery     = Packaging.Delivery.EmbedAll,
-              dependencies = Packaging.Dependencies.FatJar(jar),
-              output       = out,
-              runnerSource = Packaging.RunnerSource.Local(dir) )
-
-        Packager.pack(packaging)
-        val text: Text = out.read[Data].utf8
-
-        text.starts(t"#!/usr/bin/env bash") && text.contains(t"data=")
-        && labels.all { label => text.contains(t"$label=") }
-      .assert(_ == true)
-
-      test(m"Download embeds the JAR once and an asset row per target"):
-        val dir: Path on Linux = tempDir()
-
-        val jar: Path on Linux = dir/t"app.jar"
-        jar.create[File]()
-        jar.open[File](Write) { h ?=> h.write(Chain(t"JARBYTES".in[Data])) }
-
-        val out: Path on Linux = dir/t"hello"
-        val hashes: Map[Text, Text] = labels.map(_ -> t"0"*64).to[Map]
-
-        val packaging: Packaging =
-          Packaging
-            ( name         = t"hello",
-              targets      = labels,
-              delivery     = Packaging.Delivery.Download,
-              dependencies = Packaging.Dependencies.FatJar(jar),
-              output       = out,
-              runnerSource = Packaging.RunnerSource.Remote(t"https://r.test/", hashes) )
-
-        Packager.pack(packaging)
-        val text: Text = out.read[Data].utf8
-
-        text.contains(t"index:data=1")
-        && labels.all { label => text.contains(t"$label=https://r.test/runner-$label") }
-      .assert(_ == true)
-
-    // Docker on macOS cannot run macOS containers, so macOS coverage is host-native only.
-    if !dockerOk then Out.println(t"Docker unavailable; skipping Linux container tests")
-    else
+    // Linux via docker, using the same fake shell stubs (which run on Linux too).
+    val dockerOk = safely(sh"docker info".exec[Exit]()) == Exit.Ok
+    if scriptOk && dockerOk then
+      def linuxCheck(platform: Text, label: Text): Boolean =
+        val dir = tempDir(); val runners = fakeRunners(); val jar = fakeJar(dir); val out = dir/t"tool"
+        sh"$script embed-all --jar $jar --out $out --runners $runners".exec[Exit]()
+        val mount = t"${dir.encode}:/work"
+        val outName = out.encode.cut(t"/").reverse.prim.or(t"tool")
+        sh"docker run --rm --platform $platform -v $mount -w /work ubuntu:24.04 ./$outName".exec[Text]().trim == t"ran-$label"
       suite(m"docker linux/amd64"):
-        test(m"selects linux-x64 payload"):
-          val (dir, _) = stage()
-          val mount = t"$dir:/work"
-          sh"docker run --rm --platform linux/amd64 -v $mount -w /work ubuntu:24.04 ./hello"
-            .exec[Text]().trim
-        .assert(_ == t"hello from linux-x64")
-
+        test(m"embed-all unpacks and selects linux-x64")(linuxCheck(t"linux/amd64", t"linux-x64")).assert(_ == true)
       suite(m"docker linux/arm64"):
-        test(m"selects linux-arm64 payload"):
-          val (dir, _) = stage()
-          val mount = t"$dir:/work"
-          sh"docker run --rm --platform linux/arm64 -v $mount -w /work ubuntu:24.04 ./hello"
-            .exec[Text]().trim
-        .assert(_ == t"hello from linux-arm64")
-
-    val winHost: Optional[Text] = safely(Environment.windowsHost[Text])
-
-    winHost.let: host =>
-      val winSshOk =
-        safely(sh"ssh -o BatchMode=yes -o ConnectTimeout=5 $host echo ok".exec[Exit]()) == Exit.Ok
-
-      if !winSshOk
-      then Out.println(t"Windows host $host unreachable via SSH; skipping Windows tests")
-      else
-        val workDir: Path on Linux = tempDir()
-
-        val compilePs = workDir / t"compile.ps1"
-        compilePs.create[File]()
-        val psContent = t"""$$src = @'
-class Hello { static void Main() { System.Console.WriteLine("hello from windows-arm64"); } }
-'@
-Add-Type -TypeDefinition $$src -OutputAssembly xeq-test-hello.exe -OutputType ConsoleApplication
-"""
-        compilePs.open[File](Write): handle ?=>
-          handle.write(Chain(psContent.in[Data]))
-
-        val localExe: Path on Linux = workDir / t"hello.exe"
-
-        val bootstrapped =
-          (safely(sh"scp -q $compilePs $host:xeq-test-compile.ps1".exec[Exit]()) == Exit.Ok)
-          && (safely(sh"ssh $host powershell -ExecutionPolicy Bypass -File xeq-test-compile.ps1"
-            .exec[Exit]()) == Exit.Ok)
-          && (safely(sh"scp -q $host:xeq-test-hello.exe $localExe".exec[Exit]()) == Exit.Ok)
-
-        if !bootstrapped then
-          Out.println(t"Failed to bootstrap hello.exe on $host; skipping Windows tests")
-          safely(sh"ssh $host del /q xeq-test-*".exec[Exit]())
-        else
-          val winArm64Bytes: Data = localExe.read[Data]
-          val allPayloads: proscenium.List[Payload] =
-            payloads :+ Payload(t"windows-arm64", winArm64Bytes, gzip = false)
-          val winBundle = Xeq.installer(allPayloads)
-
-          def stageAndCopy(extension: Text): Text =
-            val script = workDir / t"hello-${Uuid().show}.$extension"
-            script.create[File]()
-            script.open[File](Write): handle ?=>
-              handle.write(Chain(winBundle))
-            val remote = t"xeq-test-${Uuid().show}.$extension"
-            sh"scp -q $script $host:$remote".exec[Exit]()
-            remote
-
-          try
-            suite(m"windows-arm64 via cmd.exe"):
-              test(m"selects windows-arm64 payload"):
-                val name = stageAndCopy(t"bat")
-                sh"ssh $host cmd /c $name".exec[Text]()
-              .assert(_.contains(t"hello from windows-arm64"))
-
-            suite(m"windows-arm64 via PowerShell"):
-              test(m"selects windows-arm64 payload"):
-                val name = stageAndCopy(t"ps1")
-                sh"ssh $host powershell -ExecutionPolicy Bypass -File $name".exec[Text]()
-              .assert(_.contains(t"hello from windows-arm64"))
-          finally
-            safely(sh"ssh $host del /q xeq-test-*".exec[Exit]())
+        test(m"embed-all unpacks and selects linux-arm64")(linuxCheck(t"linux/arm64", t"linux-arm64")).assert(_ == true)

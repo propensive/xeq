@@ -98,23 +98,16 @@ object settings:
   // surface arrives transitively.
   class Soundness(v: String):
 
-    // `xeq.core`: reading templates off the classpath, base64, gzip, files and streams.
-    val core = Seq(
-      mvn"dev.propensive:hellenism-core:$v",     // classpath resources (`cp"…"`)
-      mvn"dev.propensive:monotonous-core:$v",    // Base64 serialization
-      mvn"dev.propensive:turbulence-core:$v",    // streams
-      mvn"dev.propensive:pneumatic-flate:$v",    // Gzip
-      mvn"dev.propensive:galilei-jvm:$v")        // paths and files
-
-    // `xeq.packager`: hashing, downloading and assembling stubs.
+    // `xeq.packager`: a thin front end that shells out to the published `xeq` builder script.
     val packager = Seq(
-      mvn"dev.propensive:gastronomy-core:$v",    // SHA-256 of a downloaded stub
-      mvn"dev.propensive:telekinesis-jvm:$v",    // HTTP
-      mvn"dev.propensive:urticose-url:$v",       // URLs
-      mvn"dev.propensive:eucalyptus-core:$v",    // logging
-      mvn"dev.propensive:zeppelin-core:$v",      // ZIP surgery for the appended JAR
-      mvn"dev.propensive:guillotine-core:$v",    // `codesign` on macOS
-      mvn"dev.propensive:ambience-core:$v")      // environment and system properties
+      mvn"dev.propensive:eucalyptus-core:$v",    // logging for the subprocess
+      mvn"dev.propensive:guillotine-core:$v",    // running the builder script
+      mvn"dev.propensive:hieroglyph-core:$v",    // UTF-8 for the temp manifest and resources
+      mvn"dev.propensive:spectacular-core:$v",   // `show` for numbers passed as flags
+      mvn"dev.propensive:galilei-jvm:$v",        // paths and files
+      mvn"dev.propensive:hellenism-core:$v",     // classpath resources (`Runners`)
+      mvn"dev.propensive:turbulence-core:$v",    // streams
+      mvn"dev.propensive:ambience-core:$v")      // environment and working directory
 
     // `xeq.toolchain`: the `Jar` → executable edge of an Anthology toolchain.
     val toolchain = Seq(
@@ -123,6 +116,7 @@ object settings:
 
     // `xeq.test`.
     val test = Seq(
+      mvn"dev.propensive:gastronomy-core:$v",    // SHA-256 for byte-identity checks
       mvn"dev.propensive:probably-cli:$v",       // Suite
       mvn"dev.propensive:probably-events:$v",    // the BinTEL event stream a host runner reads
       mvn"dev.propensive:spectacular-core:$v",   // `show`
@@ -352,27 +346,23 @@ object xeq extends Module:
   // The polyglot script generator: turns payloads and asset tables into a single file that is
   // simultaneously a valid `sh` script, a `.bat` file and a PowerShell script, which unpacks or
   // downloads the executable for the platform it finds itself on and replaces itself with it.
-  object core extends Component():
-    def mvnDeps = Task(settings.Soundness(deps.soundness()).core)
-    override def scalacOptions = settings.sep(super.scalacOptions())
-
-  // Turning a `Packaging` into a distributable: obtain each platform's bare stub (locally or by
-  // verified download), patch its `ETHRCFG` block, append the application JAR, and wrap the
-  // result in a polyglot script where the delivery calls for one.
-  object packager extends Component(core):
+  // Turning a `Packaging` into a distributable: a thin front end over the published `xeq`
+  // builder script (`src/script`), which joins a bare stub, the ETHRCFG record and the JAR and
+  // generates the polyglot launchers.
+  object packager extends Component():
     def mvnDeps = Task(settings.Soundness(deps.soundness()).packager)
     override def scalacOptions = settings.sep(super.scalacOptions())
 
   // The same packaging reached as an Anthology toolchain format, so an application can be
   // compiled and packaged in one path rather than packaged as a separate step afterwards.
-  object toolchain extends Component(core, packager):
+  object toolchain extends Component(packager):
     def mvnDeps = Task(settings.Soundness(deps.soundness()).toolchain)
 
   // Suites have no `main` of their own: a host runner discovers them from the
   // `META-INF/services/probably.Suite` index the beneficence plugin writes, and drives them
   // over the BinTEL test-event protocol. `make test` assembles this module and runs
   // `fume run -c …` over the assembly, exactly as Soundness runs its own suites.
-  object test extends Component(core, packager, toolchain):
+  object test extends Component(packager, toolchain):
     def mvnDeps = Task(settings.Soundness(deps.soundness()).test)
     override def artifactName = Task("xeq-test")
     override def scalacOptions = settings.sep(super.scalacOptions())
@@ -381,7 +371,7 @@ object xeq extends Module:
   // through a real runner stub. This is the ONE module that depends on a daemon implementation
   // (Soundness's `ethereal`), because the other end of the protocol has to be *something* for an
   // end-to-end test to exist. It is deliberately outside every aggregate — nothing published
-  // from this repository depends on it, and `mill xeq.core.compile` and the test suite never
+  // from this repository depends on it, and `mill xeq.packager.compile` and the test suite never
   // resolve it. `make e2e` is what builds it.
   object example extends Component():
     def mvnDeps = Task(settings.Soundness(deps.soundness()).example)
@@ -390,7 +380,6 @@ object xeq extends Module:
 
   // Everything published from this repository. Note the absence of `example`.
   def all = Task:
-    core.compile()
     packager.compile()
     toolchain.compile()
     test.compile()

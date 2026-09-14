@@ -8,8 +8,8 @@
 //
 //   ethereal-sign sign --key <seed-file> --in <binary> --out <signed>
 //                      [--allow-downgrade]
-//     Reads <binary> (a runner+JAR file produced by an ethereal build),
-//     locates the ETHRCFG\x02 marker, sets the per-upgrade flags byte and
+//     Reads <binary> (a `stub ‖ record ‖ jar` file produced by `xeq build`),
+//     locates the ETHRCFG\x03 record, sets the per-upgrade flags byte and
 //     populates the ML-DSA-44 signature slot. Writes the result to <signed>,
 //     which is byte-for-byte the file that should be delivered as `.pending`
 //     to the target machine.
@@ -21,15 +21,19 @@ use ml_dsa::{B32, Keypair, MlDsa44, Signature, SigningKey, signature::Signer};
 use rand::{TryRngCore, rngs::OsRng};
 
 // Layout — specified in spec/ethrcfg.md; read by src/runner/src/config.rs.
-const MAGIC: [u8; 8]            = *b"ETHRCFG\x02";
+const MAGIC: [u8; 8]            = *b"ETHRCFG\x03";
 const RECORD_LEN: usize         = 3764;
 const SIGNATURE_OFFSET: usize   = 1344;
 const SIGNATURE_LEN: usize      = 2420;
 const PUBKEY_LEN: usize         = 1312;
 const SEED_LEN: usize           = 32;
 
+// The first magic with a whole record behind it — the record a builder appended after the
+// stub. (The stub itself contains no magic; the signer is not a stub, so a plain literal is
+// fine here.)
 fn find_magic(binary: &[u8]) -> Option<usize> {
-    binary.windows(MAGIC.len()).position(|w| w == MAGIC)
+    if binary.len() < RECORD_LEN { return None; }
+    binary[..=binary.len() - RECORD_LEN].windows(MAGIC.len()).position(|w| w == MAGIC)
 }
 
 fn die(msg: impl AsRef<str>) -> ! {
@@ -72,7 +76,7 @@ fn sign(seed_path: PathBuf, in_path: PathBuf, out_path: PathBuf, allow_downgrade
         .unwrap_or_else(|e| die(format!("could not read input {}: {e}", in_path.display())));
 
     let magic_offset = find_magic(&bin)
-        .unwrap_or_else(|| die("input binary does not contain the ETHRCFG\\x02 marker"));
+        .unwrap_or_else(|| die("input binary does not contain an ETHRCFG\\x03 record"));
     let block_end = magic_offset + RECORD_LEN;
     if bin.len() < block_end {
         die(format!("input binary is truncated within the ETHRCFG block at offset {magic_offset}"));

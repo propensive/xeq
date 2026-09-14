@@ -5,15 +5,15 @@ small native *runner stub* with the application's JAR appended to it: running it
 reuses) a background daemon holding a warm JVM, forwards the invocation's arguments,
 environment, streams and signals to that daemon, and returns its exit status. The stub is
 generic and reusable — it is the same bytes for every application on a given platform — so
-building an executable is byte-patching a configuration block and concatenating a JAR, not
-compiling.
+building an executable is concatenating the stub, a small configuration record and the JAR,
+not compiling.
 
 This directory is the contract between the two halves, which live in different repositories and
 release on different cadences:
 
 - **the launcher** — the Rust runner in this repository (`src/runner`), published as reusable
-  per-platform stubs, plus the packaging machinery that patches and wraps them (`src/core`,
-  `src/packager`, `src/toolchain`);
+  per-platform stubs, plus the `xeq` builder script published with them (`src/script`) and the
+  Scala packaging front ends over it (`src/packager`, `src/toolchain`);
 - **the daemon** — the JVM side that the stub launches and talks to. The reference
   implementation is `ethereal` in [Soundness](https://github.com/propensive/soundness).
 
@@ -25,8 +25,8 @@ the artefacts of the other that it tests against.
 | File | Contract |
 |---|---|
 | [`ethereal-launcher.tel`](ethereal-launcher.tel) | The wire protocol: a TEL schema whose BinTEL documents are exchanged over the daemon socket |
-| [`ethrcfg.md`](ethrcfg.md) | The `ETHRCFG` configuration block a builder patches into a stub |
-| [`properties.md`](properties.md) | The `-Dethereal.*` and `-Dbuild.*` system properties the launcher passes to the JVM |
+| [`ethrcfg.md`](ethrcfg.md) | The `ETHRCFG` configuration record a builder places between a stub and the JAR |
+| [`properties.md`](properties.md) | The `-Dethereal.*` and `-Dbuild.id` system properties the launcher passes to the JVM |
 | [`layout.md`](layout.md) | The files and directories the launcher and daemon share |
 | [`COMPATIBILITY.md`](COMPATIBILITY.md) | Which runner release speaks which protocol, and against which daemon |
 
@@ -45,7 +45,7 @@ disagrees, so a mismatched pair fails loudly at the first document instead of mi
 fields. That makes the rollout order safe but strict:
 
 1. **This repository first.** Change the contract here, change the runner, and publish a new
-   `runners-<version>` release. Nothing depends on the daemon, so this can ship alone.
+   `xeq-<version>` release. Nothing depends on the daemon, so this can ship alone.
 2. **The daemon next.** Update its copy of the schema, its pinned signature, and the runner
    version its tests fetch; release.
 3. **The packager last**, if it needs anything from the new daemon release.
