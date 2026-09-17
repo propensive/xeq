@@ -135,8 +135,15 @@ object Tests extends Suite(m"XEQ tests"):
     def fakeJar(dir: Path on Linux): Path on Linux =
       val jar = dir/t"app.jar"; writeText(jar, t"JARBYTES\n"); jar
 
+    // Not a skip. Real stubs need cargo and zig, and a Windows host cannot be conjured, so
+    // those suites step aside; the builder is a shell script that any host can produce with
+    // `make xeq-script`, so its absence means every test below would vanish and the suite
+    // would report success having run nothing — which is exactly what CI did.
     if !scriptOk then
-      Out.println(t"dist/xeq not found; run `make xeq-script` — skipping builder tests")
+      suite(m"builder script"):
+        test(m"dist/xeq exists — build it with `make xeq-script`"):
+          script.existent()
+        .assert(identity)
     else
       suite(m"record"):
         test(m"is exactly 3764 bytes and starts with the v3 magic"):
@@ -237,7 +244,17 @@ object Tests extends Suite(m"XEQ tests"):
         val mount = t"${dir.encode}:/work"
         val outName = out.encode.cut(t"/").reverse.prim.or(t"tool")
         sh"docker run --rm --platform $platform -v $mount -w /work ubuntu:24.04 ./$outName".exec[Text]().trim == t"ran-$label"
-      suite(m"docker linux/amd64"):
-        test(m"embed-all unpacks and selects linux-x64")(linuxCheck(t"linux/amd64", t"linux-x64")).assert(_ == true)
-      suite(m"docker linux/arm64"):
-        test(m"embed-all unpacks and selects linux-arm64")(linuxCheck(t"linux/arm64", t"linux-arm64")).assert(_ == true)
+      // Docker being installed does not mean every platform can run under it: linux/arm64 on
+      // an x86-64 host needs QEMU binfmt registered, which GitHub's runners do not have. Probe
+      // each platform and step aside where it cannot run, rather than reporting the
+      // environment as a failure.
+      def dockerRuns(platform: Text): Boolean =
+        safely(sh"docker run --rm --platform $platform ubuntu:24.04 true".exec[Exit]()) == Exit.Ok
+
+      if dockerRuns(t"linux/amd64") then
+        suite(m"docker linux/amd64"):
+          test(m"embed-all unpacks and selects linux-x64")(linuxCheck(t"linux/amd64", t"linux-x64")).assert(_ == true)
+
+      if dockerRuns(t"linux/arm64") then
+        suite(m"docker linux/arm64"):
+          test(m"embed-all unpacks and selects linux-arm64")(linuxCheck(t"linux/arm64", t"linux-arm64")).assert(_ == true)
