@@ -17,3 +17,6 @@ doc
 **/*.md
 LICENSE
 target
+
+# The pinned commit of propensive/.github runs the scripts around a build, not the build.
+etc/github-ref
