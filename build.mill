@@ -25,19 +25,19 @@ object settings:
   // to use its `release/lib` jars directly (fork-developer mode).
   val scalaHome = sys.env.getOrElse("SOUNDNESS_SCALA_HOME", "")
 
-  // The Soundness release XEQ's Scala modules are compiled against. Soundness publishes one
-  // GitHub release per version whose assets are the individual component jars, each embedding
-  // its own POM; `make sync-releases VERSION=X.Y.Z` in a Soundness checkout installs a release
-  // into `~/.ivy2/local`, from which coursier resolves these coordinates with no repository
-  // configuration. Component jars carry no `_3` suffix, hence the single-colon `mvn"…"`.
+  // The Soundness release XEQ's Scala modules are compiled against is pinned in etc/refs and
+  // read by `deps`, below. Soundness publishes one GitHub release per version whose assets are
+  // the individual component jars, each embedding its own POM; `make sync-deps` installs the
+  // pinned one into `~/.ivy2/local`, from which coursier resolves these coordinates with no
+  // repository configuration. Component jars carry no `_3` suffix, hence the single-colon `mvn"…"`.
   //
   // This is a dependency on Soundness's *libraries*, in one direction only. Nothing in Soundness
   // depends on XEQ, and nothing here depends on `ethereal`, the daemon: the two halves of an XEQ
   // executable meet at `spec/`, not at a coordinate.
-  val soundnessVersion = "0.65.0"
 
-  // The version XEQ's own jars are published under.
-  val xeqVersion = sys.env.getOrElse("XEQ_VERSION", "0.1.0")
+  // The version XEQ's own jars are published under. Snapshots override it through
+  // `publishVersion` (in `Component`), never here.
+  val xeqVersion = "0.1.0"
 
   val scalaOptions = Seq(
     // The fork's opt-in behaviours, enabled by name, exactly as the Soundness build enables
@@ -93,10 +93,10 @@ object settings:
   // packages would make every such reference ambiguous.
   val predef = Seq("-Yno-predef", "-Yimports:java.lang,proscenium")
 
-  // Every Soundness component XEQ's modules reach directly. Each jar's embedded POM names its
-  // own dependencies, so the rest of the surface arrives transitively.
-  object soundness:
-    val v = soundnessVersion
+  // Every Soundness component XEQ's modules reach directly, at the version `v` (the pin, read
+  // by a module's task). Each jar's embedded POM names its own dependencies, so the rest of the
+  // surface arrives transitively.
+  class Soundness(v: String):
 
     // `xeq.core`: reading templates off the classpath, base64, gzip, files and streams.
     val core = Seq(
@@ -280,6 +280,27 @@ trait Forked extends ScalaModule:
 
 // One module per source directory under `src`, with its resources under `res/<module>`, mirroring
 // the Soundness layout the sources came from.
+
+// The propensive libraries this build depends on, pinned in etc/refs (the format, the
+// snapshot flow and the shared scripts are documented in propensive/.github): each is a release
+// `X.Y.Z`, or a snapshot `X.Y.Z-<12 hex>` of an unreleased upstream build, published there by
+// `make snapshot` and installed here — transitively — by `make sync-deps`, which the shared CI
+// workflow runs too. Read through a `Task.Source`, not a `val`: the Mill daemon evaluates the
+// build script once and keeps the module tree until build.mill itself changes, so a value read
+// at evaluation time would not see the file edited.
+object deps extends Module:
+  def file = Task.Source(mill.api.BuildCtx.workspaceRoot / "etc" / "refs")
+
+  def pins: T[Map[String, String]] = Task:
+    os.read.lines(file().path).map(_.trim).filter(line => line.nonEmpty && !line.startsWith("#"))
+      .map(_.split("\t").map(_.trim).filter(_.nonEmpty))
+      .map(columns => columns(0).stripPrefix("propensive/") -> columns(1)).toMap
+
+  def version(name: String): Task[String] = Task.Anon:
+    pins().getOrElse(name, sys.error(s"etc/refs has no pin for $name"))
+
+  def soundness: T[String] = Task(version("soundness")())
+
 trait Component(dependencies: PublishModule*) extends Forked, PublishModule:
   override def scalaVersion = settings.scalaVersion
   override def scalacOptions = settings.scalaOptions ++ settings.predef
@@ -294,9 +315,9 @@ trait Component(dependencies: PublishModule*) extends Forked, PublishModule:
 
   // The beneficence compiler plugin writes the `META-INF/givens/<typeclass>` and
   // `META-INF/services/probably.Suite` index entries Soundness's runtime and test discovery read.
-  override def scalacPluginMvnDeps = Seq(
-    mvn"dev.propensive:beneficence-plugin:${settings.soundnessVersion}"
-      .exclude("org.scala-lang" -> "scala-library"))
+  override def scalacPluginMvnDeps = Task(Seq(
+    mvn"dev.propensive:beneficence-plugin:${deps.soundness()}"
+      .exclude("org.scala-lang" -> "scala-library")))
 
   // Those indexes are *fragments* of a build-wide index, one per contributing module. Mill's
   // default assembly rules are last-one-wins, which silently truncates them; concatenate instead,
@@ -306,7 +327,13 @@ trait Component(dependencies: PublishModule*) extends Forked, PublishModule:
     mill.javalib.Assembly.Rule.AppendPattern("META-INF/givens/.*"),
     mill.javalib.Assembly.Rule.AppendPattern("META-INF/services/.*"))
 
-  def publishVersion = settings.xeqVersion
+  // A `Task.Input` reading `Task.env`, not a plain value: `XEQ_RELEASE_VERSION` is how
+  // `make snapshot` (snapshot.sh in propensive/.github) drives the snapshot version through a
+  // Mill daemon that is already running — the daemon freezes `sys.env` at its own start, while
+  // `Task.env` is the environment of each `./mill` invocation. A release never sets it: the
+  // released version is `settings.xeqVersion`, and the release script insists on it.
+  def publishVersion = Task.Input:
+    Task.env.get("XEQ_RELEASE_VERSION").filter(_.nonEmpty).getOrElse(settings.xeqVersion)
   def artifactSuffix = Task("")
 
   def pomSettings = Task(PomSettings(
@@ -326,27 +353,27 @@ object xeq extends Module:
   // simultaneously a valid `sh` script, a `.bat` file and a PowerShell script, which unpacks or
   // downloads the executable for the platform it finds itself on and replaces itself with it.
   object core extends Component():
-    def mvnDeps = settings.soundness.core
+    def mvnDeps = Task(settings.Soundness(deps.soundness()).core)
     override def scalacOptions = settings.sep(super.scalacOptions())
 
   // Turning a `Packaging` into a distributable: obtain each platform's bare stub (locally or by
   // verified download), patch its `ETHRCFG` block, append the application JAR, and wrap the
   // result in a polyglot script where the delivery calls for one.
   object packager extends Component(core):
-    def mvnDeps = settings.soundness.packager
+    def mvnDeps = Task(settings.Soundness(deps.soundness()).packager)
     override def scalacOptions = settings.sep(super.scalacOptions())
 
   // The same packaging reached as an Anthology toolchain format, so an application can be
   // compiled and packaged in one path rather than packaged as a separate step afterwards.
   object toolchain extends Component(core, packager):
-    def mvnDeps = settings.soundness.toolchain
+    def mvnDeps = Task(settings.Soundness(deps.soundness()).toolchain)
 
   // Suites have no `main` of their own: a host runner discovers them from the
   // `META-INF/services/probably.Suite` index the beneficence plugin writes, and drives them
   // over the BinTEL test-event protocol. `make test` assembles this module and runs
   // `fume run -c …` over the assembly, exactly as Soundness runs its own suites.
   object test extends Component(core, packager, toolchain):
-    def mvnDeps = settings.soundness.test
+    def mvnDeps = Task(settings.Soundness(deps.soundness()).test)
     override def artifactName = Task("xeq-test")
     override def scalacOptions = settings.sep(super.scalacOptions())
 
@@ -357,7 +384,7 @@ object xeq extends Module:
   // from this repository depends on it, and `mill xeq.core.compile` and the test suite never
   // resolve it. `make e2e` is what builds it.
   object example extends Component():
-    def mvnDeps = settings.soundness.example
+    def mvnDeps = Task(settings.Soundness(deps.soundness()).example)
     override def artifactName = Task("xeq-example")
     def finalMainClass = "xeq.hello"
 
