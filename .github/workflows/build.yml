@@ -1,9 +1,9 @@
 name: Build
 
 # Build every pull request and every merge into main, via the shared workflows in
-# propensive/.github: the Scala modules with Mill (compiled only, since the suites have no `main`
-# and need a host runner such as fume), and the runner stubs' unit tests with Cargo. Both checks,
-# `build / build` and `rust / build`, are required by the ruleset on main.
+# propensive/.github: the Scala modules with Mill, their suites run by the fume pinned in
+# etc/tools, and the runner stubs' unit tests with Cargo. Both checks, `build / build` and
+# `rust / build`, are required by the ruleset on main.
 
 on:
   pull_request:
@@ -15,7 +15,8 @@ jobs:
   build:
     uses: propensive/.github/.github/workflows/scala-ci.yml@main
     with:
-      compile: xeq.all
+      compile:       xeq.all
+      test_assembly: xeq.test.assembly
 
   rust:
     uses: propensive/.github/.github/workflows/rust-ci.yml@main
