@@ -6,7 +6,7 @@
 
 MILL = ./mill
 
-.PHONY: build test cargo-test runners-build runners-fetch runners-release publishLocal sync-deps e2e clean
+.PHONY: build test cargo-test runners-build runners-fetch runners-release publishLocal sync-deps tools e2e clean
 
 # Everything published from this repository. `example` is deliberately excluded: it is the
 # end-to-end fixture, and the only module that depends on a daemon implementation.
@@ -43,6 +43,10 @@ runners-release:
 # Install the Soundness release pinned in etc/refs into ~/.ivy2/local, as CI does.
 sync-deps:
 	./etc/shared sync-deps.sh
+
+# Install the commands pinned in etc/tools (fume) through their releases' installers.
+tools:
+	./etc/shared tools.sh
 
 # Install the jars into ~/.ivy2/local, where coursier finds them with no repository
 # configuration — how a downstream build consumes XEQ before it has a published home.
