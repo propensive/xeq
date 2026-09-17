@@ -87,7 +87,7 @@ object Tests extends Suite(m"XEQ tests"):
     try runTestsBody(tempDir) finally tempDirs.each: dir =>
       safely(dir.delete())
 
-  private def runTestsBody(tempDir: () => Path on Linux): Unit =
+  private def runTestsBody(tempDir: () -> Path on Linux): Unit =
     val labels: List[Text] = List(t"linux-x64", t"linux-arm64", t"macos-x64", t"macos-arm64")
 
     val payloads: proscenium.List[Payload] = proscenium.List.from:
