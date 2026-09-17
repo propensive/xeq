@@ -6,7 +6,7 @@
 
 MILL = ./mill
 
-.PHONY: build test cargo-test runners-build runners-fetch runners-release xeq-script publishLocal sync-deps tools e2e clean
+.PHONY: check build test cargo-test runners-build runners-fetch runners-release xeq-script publishLocal sync-deps tools e2e clean
 
 # Everything published from this repository. `example` is deliberately excluded: it is the
 # end-to-end fixture, and the only module that depends on a daemon implementation.
@@ -43,6 +43,13 @@ runners-release:
 # Install the Soundness release pinned in etc/refs into ~/.ivy2/local, as CI does.
 sync-deps:
 	./etc/shared sync-deps.sh
+
+# Check every source against Consequent Style and the project's own rules with flair (the
+# release pinned in etc/tools; `make tools` installs it), as configured in
+# .pyrocosm/flair/config.tel. Findings are warnings and the count is not yet zero, so CI does
+# not run this; PATHS restricts the check to files beneath them.
+check:
+	flair check $(PATHS)
 
 # Install the commands pinned in etc/tools (fume) through their releases' installers.
 tools:
