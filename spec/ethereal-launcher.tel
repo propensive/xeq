@@ -19,12 +19,17 @@ record Init
   description
       A new invocation: the connection then carries the client's
       stdin to the daemon and the daemon's stdout to the client.
+      The three tty flags say which of the client's streams are
+      attached to a terminal; the daemon sees only sockets and
+      cannot determine this for itself.
   field pid String required
   field uid String required
   field username String required
   field script String required
   field pwd String required
-  field tty Flag optional
+  field stdin-tty Flag optional
+  field stdout-tty Flag optional
+  field stderr-tty Flag optional
   field argument String optional repeatable
   field environment String optional repeatable
 

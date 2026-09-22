@@ -13,14 +13,16 @@ pub enum SignalAck {
 }
 
 pub struct ClientInfo {
-    pub pid:       u32,
-    pub user_id:   u32,
-    pub user_name: String,
-    pub script:    String,
-    pub pwd:       String,
-    pub args:      Vec<String>,
-    pub env:       Vec<String>,
-    pub is_tty:    bool,
+    pub pid:        u32,
+    pub user_id:    u32,
+    pub user_name:  String,
+    pub script:     String,
+    pub pwd:        String,
+    pub args:       Vec<String>,
+    pub env:        Vec<String>,
+    pub stdin_tty:  bool,
+    pub stdout_tty: bool,
+    pub stderr_tty: bool,
 }
 
 // Every connection to the daemon opens with one BinTEL document of the `ethereal-launcher`
@@ -36,9 +38,13 @@ pub fn init_document(info: &ClientInfo) -> Vec<u8> {
     record.scalar(2, &info.user_name);
     record.scalar(3, &info.script);
     record.scalar(4, &info.pwd);
-    if info.is_tty { record.flag(5); }
-    for argument in &info.args { record.scalar(6, argument); }
-    for variable in &info.env { record.scalar(7, variable); }
+    // §7.2 canonical order is member order, so the three flags are written
+    // before the repeatable fields that follow them in the schema.
+    if info.stdin_tty { record.flag(5); }
+    if info.stdout_tty { record.flag(6); }
+    if info.stderr_tty { record.flag(7); }
+    for argument in &info.args { record.scalar(8, argument); }
+    for variable in &info.env { record.scalar(9, variable); }
     bintel::document(variant::INIT, record)
 }
 

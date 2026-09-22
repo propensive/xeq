@@ -58,4 +58,13 @@ import threading.virtualThreading
 def hello(): Unit = cli:
   execute:
     Out.println(t"Hello world")
+
+    // On stderr, so the `Hello world` the end-to-end script captures on stdout stays the
+    // only thing there. Reporting all three lets a redirection be checked from the outside:
+    // whichever stream is redirected, one of the others still carries the report.
+    val in = service.cliInput.toString.tt
+    val out = service.cliOutput.toString.tt
+    val err = service.cliError.toString.tt
+    Err.println(t"streams: stdin=$in stdout=$out stderr=$err")
+
     Exit.Ok
