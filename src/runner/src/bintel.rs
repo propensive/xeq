@@ -21,9 +21,9 @@ pub const MAGIC: [u8; 4] = [0xB2, 0xC4, 0xB5, 0xBB];
 /// The §8 palimpsest signature of the `ethereal-launcher` schema (BLAKE3-256 of its base
 /// component plus the cadence byte), pinned here and in the daemon's tests.
 pub const SIGNATURE: [u8; 33] = [
-    0xee, 0xce, 0xd1, 0x65, 0xc1, 0x5f, 0x73, 0x11, 0x9c, 0xf7, 0x71, 0x08, 0x12, 0x67, 0x19,
-    0x24, 0xaa, 0x55, 0x87, 0x22, 0x92, 0x7d, 0x29, 0xf3, 0x75, 0x38, 0xe7, 0xb3, 0x95, 0x32,
-    0x96, 0xc2, 0xce,
+    0xe5, 0x0b, 0x7e, 0x82, 0xc1, 0x1b, 0x06, 0x78, 0x3d, 0xaf, 0xa8, 0xa2, 0xec, 0xc4, 0xe3,
+    0x5f, 0x7b, 0xa3, 0x10, 0x44, 0xec, 0xd3, 0x8f, 0xc5, 0xd9, 0xfe, 0x9e, 0x47, 0xa7, 0xc1,
+    0x1e, 0x59, 0xe5,
 ];
 
 /// Variant indices of `select Message`, in the schema's declaration order.
@@ -38,6 +38,10 @@ pub mod variant {
     pub const VERDICT: u64 = 7;
     pub const MODE: u64 = 8;
     pub const EXIT_STATUS: u64 = 9;
+    pub const CLOSED: u64 = 10;
+    // Sent by tooling, never by the launcher itself; listed so the indices stay complete.
+    #[allow(dead_code)]
+    pub const SHUTDOWN: u64 = 11;
 }
 
 /// The daemon reads documents from a peer it did not choose; so does the runner. A reply
@@ -269,7 +273,7 @@ mod tests {
 
     #[test]
     fn frames_match_the_daemon_side() {
-        let sig = "eeced165c15f73119cf7710812671924aa558722927d29f37538e7b3953296c2ce";
+        let sig = "e50b7e82c11b06783dafa8a2ecc4e35f7ba31044ecd38fc5d9fe9e47a7c11e59e5";
         let mut record = Record::new();
         record.scalar(0, "42");
         assert_eq!(hex(&document(variant::EXIT, record)),
@@ -284,13 +288,26 @@ mod tests {
         // run from a terminal. An all-true fixture would not catch the three flags being
         // written in the wrong order or under the wrong indices.
         let info = crate::protocol::ClientInfo {
-            pid: 7, user_id: 501, user_name: "jon".into(), script: "/usr/bin/x".into(),
-            pwd: "/tmp".into(), args: vec!["a".into(), "b c".into()],
-            env: vec!["K=V".into()],
-            stdin_tty: true, stdout_tty: false, stderr_tty: true,
+            pid: 7, user_id: "501".into(), user_name: "jon".into(), script: "/usr/bin/x".into(),
+            invoked_as: Some("x".into()), pwd: "/tmp".into(), args: vec!["a".into(), "b c".into()],
+            env: vec!["K=V".into()], stdin_tty: true, stdout_tty: false, stderr_tty: true,
+            umask: Some("022".into()), size: None, codepages: None,
         };
+        // pid, uid, username, script, pwd; stdin-tty and stderr-tty flags (5, 7); the two
+        // arguments (8); the environment (9); invoked-as (10); umask (11).
         assert_eq!(hex(&crate::protocol::init_document(&info)),
-                   format!("b2c4b5bb5321{sig}01000a000137010335303102036a6f6e030a2f7573722f62696e2f7804042f746d700507080161080362206309034b3d56"));
+                   format!("b2c4b5bb5b21{sig}01000c000137010335303102036a6f6e030a2f7573722f62696e2f7804042f746d700507080161080362206309034b3d560a01780b03303232"));
+
+        // A WINCH carries the terminal's size (fields 2 and 3); a Windows close, its deadline.
+        let detail = crate::protocol::SignalDetail { size: Some((80, 24)), deadline_ms: None };
+        assert_eq!(hex(&crate::protocol::signal_document(7, "WINCH", detail)),
+                   format!("b2c4b5bb3721{sig}010304000137010557494e43480202383003023234"));
+        let detail = crate::protocol::SignalDetail { size: None, deadline_ms: Some(5000) };
+        assert_eq!(hex(&crate::protocol::signal_document(7, "CTRL_CLOSE", detail)),
+                   format!("b2c4b5bb3a21{sig}010303000137010a4354524c5f434c4f5345040435303030"));
+
+        assert_eq!(hex(&crate::protocol::closed_document(7, "stdout")),
+                   format!("b2c4b5bb3021{sig}010a0200013701067374646f7574"));
     }
 
     #[test]

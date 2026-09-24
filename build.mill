@@ -123,7 +123,8 @@ object settings:
       mvn"dev.propensive:escapade-core:$v",      // Teletype
       mvn"dev.propensive:profanity-core:$v",     // termcaps
       mvn"dev.propensive:digression-ansi:$v",    // stack-trace diagnostics
-      mvn"dev.propensive:inimitable-core:$v")    // Uuid, for scratch filenames
+      mvn"dev.propensive:inimitable-core:$v",    // Uuid, for scratch filenames
+      mvn"dev.propensive:stratiform-binary:$v")  // the schema signature, derived from spec/
 
     // `xeq.example`: the end-to-end fixture, and the ONLY place the daemon appears. It is not a
     // dependency of any published XEQ artifact — see the module's comment.
@@ -366,6 +367,14 @@ object xeq extends Module:
     def mvnDeps = Task(settings.Soundness(deps.soundness()).test)
     override def artifactName = Task("xeq-test")
     override def scalacOptions = settings.sep(super.scalacOptions())
+
+    // The protocol schema and the runner's copy of its signature are read off the classpath,
+    // so the suite can compare them wherever its host runner's working directory happens
+    // to be.
+    def contract = Task.Sources(
+      mill.api.BuildCtx.workspaceRoot / "spec",
+      mill.api.BuildCtx.workspaceRoot / "src" / "runner" / "src")
+    override def resources = Task(super.resources() ++ contract())
 
   // Everything the builder bakes into the script: the release version, base URL and stub
   // hashes, the polyglot templates, and the three shell sections it splices together.

@@ -152,6 +152,51 @@ object Tests extends Suite(m"XEQ tests"):
           (size(rec), sh"head -c 7 ${rec.encode}".exec[Text]().trim)
         .assert(_ == (t"3764", t"ETHRCFG"))
 
+    // The schema in `spec/ethereal-launcher.tel` is the contract, and `src/runner/src/bintel.rs`
+    // pins its signature as the constant the runner compares on the wire. Derive the one from
+    // the other, so that neither can change without the other: a schema edit that forgets the
+    // constant, or a constant edited by hand, fails here rather than at the first document.
+    suite(m"Launcher protocol"):
+      import stratiform.*
+      // Read from the jar this suite was loaded from: the host runner's classloader does
+      // not expose the jar's resources by name.
+      def resource(name: String): Text =
+        val location = Tests.getClass.nn.getProtectionDomain.nn.getCodeSource.nn.getLocation.nn
+        val zip = java.util.zip.ZipFile(java.io.File(location.toURI.nn))
+        try
+          val entry = zip.getEntry(name).nn
+          String(zip.getInputStream(entry).nn.readAllBytes().nn, "UTF-8").tt
+        finally zip.close()
+
+      val schemaText: Text = resource("ethereal-launcher.tel")
+      val rust: Text = resource("bintel.rs")
+
+      def hex(data: Data): Text =
+        val builder = StringBuilder()
+        var i = 0
+        while i < data.length do
+          builder.append(String.format("%02x", Integer.valueOf(data.readable(i) & 0xff)))
+          i += 1
+        builder.toString.tt
+
+      def derived: Text = hex(SchemaSignature.fromDocument(schemaText.read[Tel], Tels.Axiom.tels))
+
+      // The hex bytes of the `SIGNATURE` constant, in order.
+      def pinned: Text =
+        val source: String = rust.s
+        val start = source.indexOf("pub const SIGNATURE")
+        val end = source.indexOf("];", start)
+        val builder = StringBuilder()
+        var i = source.indexOf("0x", start)
+        while i >= 0 && i < end do
+          builder.append(source.substring(i + 2, i + 4).nn)
+          i = source.indexOf("0x", i + 4)
+        builder.toString.tt
+
+      test(m"the runner pins the signature of the schema in spec/"):
+        derived
+      .check(_ == pinned)
+
       suite(m"build (native)"):
         test(m"output equals stub \u2016 record \u2016 jar, byte for byte"):
           val dir = tempDir(); val runners = fakeRunners(); val jar = fakeJar(dir)

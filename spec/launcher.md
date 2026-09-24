@@ -2,9 +2,9 @@
 
 The protocol schema says what the two halves exchange. This document says what the launcher
 does *around* that exchange — which argument values it keeps for itself, what it does to the
-client's terminal, and how a signal or an end-of-file on the client's side reaches the daemon —
-because an application author has to live with all of it, and a daemon implementation has to
-expect it.
+client's terminal, what it learns about the client and how, and how a signal or an end-of-file
+on the client's side reaches the daemon — because an application author has to live with all
+of it, and a daemon implementation has to expect it.
 
 ## Reserved arguments and environment variables
 
@@ -16,8 +16,8 @@ argument vector at all. One argument form is also accepted, for a user at a shel
 | `XEQ_DOWNLOAD` | Set (to anything but the empty string or `0`): download a JVM if no suitable one is installed, rather than failing with instructions |
 | `--download` | The same request, recognised **only when it is the sole argument**. `mytool --download` downloads a JVM if necessary, starts the daemon, and runs the application *with no arguments*. In any other position — `mytool install --download`, `mytool -- --download` — the argument belongs to the application and is delivered unchanged |
 | `XEQ_WRAP_JAVA` | Internal. Set by the launcher on the process it starts the JVM through, so the daemon appears under the application's name; never set it yourself |
-| `ETHEREAL_DEBUG` | Set: the launcher traces its progress to stderr and to `$TMPDIR/ethereal-launcher.log` |
-| `ETHEREAL_SIGNAL_TIMEOUT_MS` | How long the launcher waits for the daemon to acknowledge a forwarded signal; default 250 |
+| `ETHEREAL_DEBUG` | Set: the launcher traces its progress to stderr and to `$TMPDIR/ethereal-launcher.log`, which is otherwise never written |
+| `ETHEREAL_SIGNAL_TIMEOUT_MS` | How long the launcher waits for the daemon to acknowledge a forwarded signal before taking the signal's fallback action (below); default 250 |
 
 Two argument values are reserved by the **daemon** rather than the launcher, as the first
 argument only: `{completions}`, under which the reference daemon computes shell completions,
@@ -29,16 +29,58 @@ application built on the reference daemon cannot use either as its own first arg
 Nothing else is intercepted. In particular the launcher never removes an argument from the
 middle of the vector.
 
-## Text on the wire
+## What the daemon is told
 
-Arguments, environment variables, the working directory and the script path are transmitted
-as text, and the protocol's scalars must be valid UTF-8 (BinTEL §7.1). A value that is not —
-on Linux and macOS, a byte sequence that is not UTF-8; on Windows, an unpaired UTF-16
-surrogate — is delivered with U+FFFD in place of each sequence that cannot be represented.
-This is a documented loss, not a failure: the launcher does not abort on such a value, and the
-substitution is exactly the one the JVM makes when it decodes its own argument vector, so an
-application sees what it would have seen if run directly. A re-exec after a self-upgrade
-passes the original bytes on, since they are still the launcher's to give.
+The `init` document carries what follows. The daemon holds a socket, not the client's
+process, so for each of these the document is its only source.
+
+| Field | Source |
+|---|---|
+| `pid` | The launcher's process id |
+| `uid` | The invoking user: the *real* user id on Unix (`getuid`), the user's SID (`S-1-5-…`) on Windows, read from the process token; empty if that fails |
+| `username` | `$USER`, then `$LOGNAME`, on Unix; `%USERNAME%` on Windows. Whatever the environment says, in other words, and not authenticated |
+| `script` | The canonical path of the running executable, asked of the operating system — never derived from `argv[0]` |
+| `invoked-as` | `argv[0]` exactly as the caller supplied it, so a multi-call binary — one executable installed under several names by symbolic links — can dispatch on the name it was invoked by. It is the caller's to choose and may be anything, including a path that does not exist; never use it to locate a file. The daemon and its state directory are keyed on the executable, not on this name, so every alias shares one warm daemon, and a daemon must therefore serve concurrent invocations under different names |
+| `pwd` | The working directory |
+| `argument` | The arguments, in order, after the launcher's own (above) |
+| `environment` | The environment, as `NAME=value`, with the injections described below |
+| `stdin-tty`, `stdout-tty`, `stderr-tty` | Whether each standard stream is a terminal (`isatty`; on Windows a console, or one of the pipes through which MSYS2, Cygwin and mintty present a pseudo-terminal). `stdin-tty` is *unset* for a terminal the launcher decided not to read: see *The terminal* |
+| `umask` | The client's file-creation mask, in octal (`022`); absent on Windows. The daemon should apply it to files the invocation creates; it is process-wide state in a daemon serving several invocations, so that takes care on its side |
+| `columns`, `rows` | The terminal's size, when stdout is a terminal: `TIOCGWINSZ` on the first of stdout, stdin and stderr that is a terminal, or the console screen buffer's window on Windows. Absent when no stream is a terminal or the size is unknown (a pseudo-terminal whose size was never set reports zero). The same values are sent again with `WINCH` and `CONT`, so a daemon never needs to probe the terminal by escape sequence |
+| `input-codepage`, `output-codepage` | On Windows, the console's input and output code pages (`GetConsoleCP`, `GetConsoleOutputCP`), so the daemon can decode what it reads and encode what it writes for a console that is not UTF-8 |
+
+**Environment injection.** The launcher measures the terminal itself and delivers the result
+in the environment, replacing what was inherited, since inherited values are unreliable across
+a shared daemon: any inherited `COLUMNS` and `LINES` are removed and the measured size
+substituted, and any inherited `TERMINAL_BG` is removed and the terminal's background colour
+(from an OSC 11 query, as `rgb:RRRR/GGGG/BBBB`) substituted. When the launcher measured nothing
+the inherited values are passed through unchanged, so their presence alone does not mean a
+terminal was detected; the `columns` and `rows` fields and the tty flags do. New code should
+read the fields; the variables remain for applications that read the environment.
+
+**Text on the wire.** Every value above is text, and the protocol's scalars must be valid
+UTF-8 (BinTEL §7.1). A value that is not — on Linux and macOS, a byte sequence that is not
+UTF-8; on Windows, an unpaired UTF-16 surrogate — is delivered with U+FFFD in place of each
+sequence that cannot be represented. This is a documented loss, not a failure: the launcher
+does not abort on such a value, and the substitution is exactly the one the JVM makes when it
+decodes its own argument vector, so an application sees what it would have seen if run
+directly. A re-exec after a self-upgrade passes the original bytes on, since they are still
+the launcher's to give.
+
+**Context that does not cross the socket.** The invocation runs in the daemon's process, and
+inherits that process's context, not the client's, for everything not listed above:
+
+- resource limits (`ulimit`), so a limit set for one command has no effect on it;
+- nice level and scheduling class;
+- cgroup or container membership on Linux, and any memory or CPU limit that comes with it;
+- the macOS sandbox profile and any SELinux or AppArmor context;
+- the *effective* user under setuid: `uid` is the real user of the invocation, while the daemon
+  runs — and was launched — as the effective user (`ethereal.user.id`, `properties.md`), and
+  the two can differ. Neither is authenticated by the daemon on the strength of the document
+  alone; see `layout.md` on the socket's permissions and peer credentials.
+
+An author of a security- or resource-sensitive tool should not rely on any of these
+following the client.
 
 ## The terminal
 
@@ -50,10 +92,11 @@ the launcher:
    generation from keys (`ISIG` off, `VINTR` undefined), with output post-processing kept on —
    so that every keystroke reaches the application as bytes;
 3. asks the terminal for its background colour (OSC 11), waiting briefly for the reply, and
-   delivers it as `TERMINAL_BG` in the invocation's environment; any other bytes the user typed
-   meanwhile are pushed back ahead of stdin, not lost;
-4. measures the terminal's size and delivers it as `COLUMNS` and `LINES`, replacing any
-   inherited values;
+   delivers it as `TERMINAL_BG`; any other bytes the user typed meanwhile are pushed back
+   ahead of stdin, not lost. On Windows the query is made only under Windows Terminal
+   (`WT_SESSION` set), since the classic console leaves an unanswered query in the input;
+4. measures the terminal's size and delivers it as `COLUMNS` and `LINES`, and as the `columns`
+   and `rows` fields;
 5. opens the control channel (`control`), on which the daemon may ask for the terminal to be
    put into canonical (cooked) mode and back (`mode`), for a command that wants the driver's
    own line editing.
@@ -67,6 +110,9 @@ and stdout and stderr forwarded as usual. A job that is later foregrounded and c
 When stdin is not a terminal — a pipe or a file — nothing is reconfigured, and stdin is
 forwarded until it ends.
 
+An MSYS2, Cygwin or mintty pseudo-terminal on Windows is reported as a terminal but cannot be
+reconfigured through the console API, so it stays in whatever mode the pseudo-terminal is in.
+
 ## End of input
 
 The connection that carries the invocation's stdin also carries its stdout. When the client's
@@ -79,12 +125,26 @@ client is gone only when the connection closes entirely.
 A terminal in raw mode never delivers end-of-file: Ctrl-D is the byte 0x04, and it is the
 application's to interpret.
 
+## End of output
+
+When the client's side of an output stream can no longer be written — `mytool | head -1`, once
+`head` has gone — a process writing a pipe would get SIGPIPE or `EPIPE`. The invocation is
+writing a socket the launcher reads, so nothing of the kind happens by itself. Instead the
+launcher sends a `closed` document naming the stream (`stdout` or `stderr`) on a fresh
+connection, once, and expects no answer; the daemon should then fail the invocation's further
+writes to that stream as a broken pipe would, so that a program which writes until it cannot
+ends. The launcher goes on reading and discarding the stream regardless, so a daemon that does
+not act on the document is never blocked writing it, and the invocation still ends when it
+chooses to.
+
 ## Signals
 
 On Linux and macOS the launcher forwards these signals to the daemon as `signal` documents,
 named without their `SIG` prefix: `INT`, `QUIT`, `TERM`, `HUP`, `WINCH`, `USR1`, `USR2`, `TSTP`
-and `CONT`. The daemon answers each with a `signal-ack` saying whether the invocation accepted
-it. What the launcher does next depends on the signal:
+and `CONT`. `WINCH` and `CONT` carry the terminal's current size in `columns` and `rows`, since
+a signal has no payload of its own and the daemon holds no terminal to ask. The daemon answers
+each with a `signal-ack` saying whether the invocation accepted it. What the launcher does next
+depends on the signal:
 
 | Signal | Accepted | Rejected, or no answer within the timeout |
 |---|---|---|
@@ -98,9 +158,10 @@ it. What the launcher does next depends on the signal:
 terminal's saved attributes so the shell finds it as it left it, and then stops, by taking the
 signal's default action. On `CONT` it re-applies raw mode — only if it owned the terminal's
 mode before, and only if it is once more in the foreground, since from the background that
-would stop it again — and forwards `CONT`, so an application can redraw. A terminal in raw
-mode does not generate `TSTP` from Ctrl-Z (that byte, 0x1A, goes to the application); the
-path is exercised by `kill -TSTP`, and by Ctrl-Z when stdin is a pipe.
+would stop it again — and forwards `CONT` with the terminal's size, since the window may have
+been resized while the job was stopped, so an application can redraw. A terminal in raw mode
+does not generate `TSTP` from Ctrl-Z (that byte, 0x1A, goes to the application); the path is
+exercised by `kill -TSTP`, and by Ctrl-Z when stdin is a pipe.
 
 **Inherited dispositions.** A signal the launcher inherits as *ignored* stays ignored: no
 handler is installed, nothing is forwarded, and the launcher can never die of it. That is how
@@ -129,14 +190,22 @@ that want it.
 **Windows** has no signals. The console control events `CTRL_C_EVENT`, `CTRL_BREAK_EVENT`,
 `CTRL_CLOSE_EVENT`, `CTRL_LOGOFF_EVENT` and `CTRL_SHUTDOWN_EVENT` are forwarded as `signal`
 documents named `CTRL_C`, `CTRL_BREAK`, `CTRL_CLOSE`, `CTRL_LOGOFF` and `CTRL_SHUTDOWN`, in
-either terminal state. A rejected or unanswered event ends the launcher with the system's own
+either terminal state. The last three carry a `deadline`, in milliseconds (5000): Windows ends
+the process about that long after the event whatever it is doing, so the application knows how
+long it has to finish. A rejected or unanswered event ends the launcher with the system's own
 status for a process ended by a control event, `STATUS_CONTROL_C_EXIT` (`0xC000013A`); an
 accepted close, logoff or shutdown drains the invocation's stderr and then ends with the same
 status, since the system is about to end the process regardless.
+
+Windows has no `SIGWINCH` either, and a resize arrives as a console input record, which the
+launcher cannot read without taking keystrokes from stdin. It polls the console's window size
+instead, a few times a second while stdout is a console, and sends `WINCH` with the new
+`columns` and `rows` when it changes.
 
 ## Exit status
 
 Once the invocation's stdout and stderr have both ended, the launcher asks the daemon for the
 invocation's exit status (`exit`) and exits with it. A launcher that cannot reach the daemon
-exits with 2; one that was terminated by a signal dies of that signal, as above, and never
-asks.
+exits with 2; so does one whose daemon accepts the connection but does not answer within the
+reply timeout (`layout.md`, *Lifecycle*), after saying so on stderr. One that was terminated
+by a signal dies of that signal, as above, and never asks.

@@ -76,6 +76,7 @@ fn main() {
         wrapper::run(&raw[1..]);
     }
 
+    let invoked_as = raw.first().map(|arg| arg.to_string_lossy().into_owned());
     let (script, args, download) = parse_arguments(raw);
     let name = script.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     debug!("main: script={} name={} args={:?}", script.display(), name, args);
@@ -95,7 +96,10 @@ fn main() {
     debug!("main: post-update-check");
 
     let base_dir = state::base_dir(&name);
-    let _ = std::fs::create_dir_all(&base_dir);
+    if let Err(reason) = state::prepare_base_dir(&base_dir) {
+        eprintln!("\nThe {name} state directory {} cannot be used: {reason}.", base_dir.display());
+        std::process::exit(STARTUP_FAILURE_EXIT_CODE);
+    }
     let build_file  = base_dir.join("build");
     let pid_file    = base_dir.join("pid");
     let socket_file = base_dir.join("socket");
@@ -154,6 +158,10 @@ fn main() {
         state::report_failure(&base_dir, &name, "its socket does not accept connections");
         std::process::exit(STARTUP_FAILURE_EXIT_CODE);
     }
+    if let Err(reason) = state::socket_private(&socket_file) {
+        eprintln!("\nThe {name} daemon socket {} is not trusted: {reason}.", socket_file.display());
+        std::process::exit(STARTUP_FAILURE_EXIT_CODE);
+    }
     debug!("main: socket is alive");
 
     if internal {
@@ -183,7 +191,7 @@ fn main() {
     };
     debug!("main: bg_color={:?} leftover={}bytes", bg_color, leftover.len());
 
-    let info = ClientInfo::collect(&script, &args, attached, bg_color.as_deref());
+    let info = ClientInfo::collect(&script, invoked_as, &args, attached, bg_color.as_deref());
     debug!("main: connecting to daemon (pid={})", info.pid);
     let (main_socket, stderr_socket) = match connect_to_daemon(&socket_file, &info) {
         Ok(connections) => { debug!("main: connected to daemon"); connections },
@@ -222,21 +230,23 @@ fn main() {
     } else {
         let _ = stdin_socket.shutdown(Shutdown::Write);
     }
-    let stdout_thread = spawn_forwarder(
+    let stdout_thread = spawn_output_forwarder(
         main_socket.try_clone().expect("clone main socket"),
         std::io::stdout(),
-        true,
+        socket_file.clone(), info.pid, "stdout",
     );
-    let stderr_thread = spawn_forwarder(
+    let stderr_thread = spawn_output_forwarder(
         stderr_socket.try_clone().expect("clone stderr socket"),
         std::io::stderr(),
-        true,
+        socket_file.clone(), info.pid, "stderr",
     );
 
     // Set to the terminating signal's number (or, on Windows, the exit code for the console
     // event) once the daemon has accepted a termination the launcher must follow.
     let termination = Arc::new(AtomicI32::new(0));
     signals::install(socket_file.clone(), info.pid, termination.clone(), saved_tty, attached);
+    #[cfg(windows)]
+    if info.stdout_tty { signals::watch_for_resize(); }
 
     // When termination is flagged, shut down the main socket so the stdout forwarder
     // unblocks at once, then bound the stderr drain: the daemon closes that connection when
@@ -391,12 +401,44 @@ fn forward(mut reader: impl Read, mut writer: impl Write, flush_each_chunk: bool
     let _ = writer.flush();
 }
 
+// An output direction: the invocation's stdout or stderr, to the client's. When the client's
+// side can no longer be written — `mytool | head -1`, once head has gone — the daemon is told
+// (`closed`) so it can fail the invocation's writes as a broken pipe would, and the socket
+// goes on being drained so that a daemon which does not act on that is never blocked writing
+// it, which would leave the invocation, and so the launcher, waiting forever.
+fn spawn_output_forwarder(
+    mut reader: UnixStream,
+    mut writer: impl Write + Send + 'static,
+    socket_file: PathBuf,
+    pid: u32,
+    stream: &'static str,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; FORWARD_BUFFER_SIZE];
+        let mut open = true;
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    if open && writer.write_all(&buffer[..count]).is_err() {
+                        debug!("main: {} has no reader; telling the daemon", stream);
+                        open = false;
+                        protocol::send_closed(&socket_file, pid, stream);
+                    }
+                    if open { let _ = writer.flush(); }
+                }
+            }
+        }
+        if open { let _ = writer.flush(); }
+    })
+}
+
 fn run_non_interactive(socket_file: &Path, script: &Path, args: &[OsString]) -> i32 {
     debug_log(format!(
         "run_non_interactive socket={} args={:?}", socket_file.display(), args,
     ));
 
-    let info = ClientInfo::collect(script, args, false, None);
+    let info = ClientInfo::collect(script, None, args, false, None);
     let (main_socket, stderr_socket) = match connect_to_daemon(socket_file, &info) {
         Ok(connections) => { debug_log("connected"); connections }
         Err(error) => {
@@ -427,10 +469,13 @@ impl ClientInfo {
     // decode it. That is a documented loss, not a crash: see `spec/launcher.md`.
     pub fn collect(
         script: &Path,
+        invoked_as: Option<String>,
         args: &[OsString],
         stdin_tty: bool,
         bg_color: Option<&str>,
     ) -> Self {
+        let stdout_tty = tty::stdout_is_tty();
+        let stderr_tty = tty::stderr_is_tty();
         let size = tty::terminal_size();
         let mut env: Vec<String> = env::vars_os()
             .filter(|(name, _)| {
@@ -463,6 +508,7 @@ impl ClientInfo {
             user_id: user_info::uid(),
             user_name: user_info::username(),
             script: script.to_string_lossy().into_owned(),
+            invoked_as,
             pwd: env::current_dir()
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -473,15 +519,25 @@ impl ClientInfo {
             // that `cooked` blocks do not wait on a control channel it never opens. Nothing
             // makes the output streams worth lying about, so those are asked directly.
             stdin_tty,
-            stdout_tty: tty::stdout_is_tty(),
-            stderr_tty: tty::stderr_is_tty(),
+            stdout_tty,
+            stderr_tty,
+            umask: tty::umask(),
+            size: if stdout_tty { size } else { None },
+            codepages: tty::codepages(),
         }
     }
 }
 
-mod user_info {
+// Who is invoking. On Unix the real user id (`uid`) identifies the invocation, and the
+// effective one (`effective_uid`) the daemon's own file access; they differ under setuid,
+// and neither is authenticated by the daemon. On Windows both are the user's SID, which is
+// the identity Windows itself uses; the username is only what the environment says.
+pub mod user_info {
     #[cfg(unix)]
-    pub fn uid() -> u32 { unsafe { libc::getuid() as u32 } }
+    pub fn uid() -> String { unsafe { libc::getuid() }.to_string() }
+
+    #[cfg(unix)]
+    pub fn effective_uid() -> String { unsafe { libc::geteuid() }.to_string() }
 
     #[cfg(unix)]
     pub fn username() -> String {
@@ -489,10 +545,44 @@ mod user_info {
     }
 
     #[cfg(windows)]
-    pub fn uid() -> u32 { 0 }
+    pub fn uid() -> String { sid().unwrap_or_default() }
+
+    #[cfg(windows)]
+    pub fn effective_uid() -> String { uid() }
 
     #[cfg(windows)]
     pub fn username() -> String { std::env::var("USERNAME").unwrap_or_default() }
+
+    // The SID of the user this process runs as, as text (`S-1-5-21-…`), from the process
+    // token. Empty on any failure: the daemon treats an empty identity as unknown.
+    #[cfg(windows)]
+    fn sid() -> Option<String> {
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 { return None; }
+            let mut needed: u32 = 0;
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+            let mut buffer = vec![0u8; needed as usize];
+            let ok = GetTokenInformation(
+                token, TokenUser, buffer.as_mut_ptr() as *mut _, needed, &mut needed,
+            );
+            CloseHandle(token);
+            if ok == 0 { return None; }
+            let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+            let mut text: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 { return None; }
+            let mut length = 0;
+            while *text.add(length) != 0 { length += 1; }
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+            LocalFree(text as HLOCAL);
+            Some(sid)
+        }
+    }
 }
 
 pub fn now_ms() -> u128 {
@@ -592,7 +682,7 @@ mod tests {
     fn arguments_that_are_not_utf8_are_carried_lossily_rather_than_panicking() {
         use std::os::unix::ffi::OsStringExt;
         let args = vec![OsString::from_vec(vec![b'a', 0xff, b'b'])];
-        let info = ClientInfo::collect(Path::new("/x"), &args, false, None);
+        let info = ClientInfo::collect(Path::new("/x"), None, &args, false, None);
         assert_eq!(info.args, vec!["a\u{fffd}b".to_string()]);
     }
 }

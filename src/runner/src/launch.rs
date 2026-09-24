@@ -199,10 +199,9 @@ pub fn idle_reason(outcome: &Outcome) -> String {
 fn build_java_arguments(script: &Path, name: &str, progress_file: &Path, config: &BuildConfig) -> Vec<String> {
     let jar_size = std::fs::metadata(script).map(|metadata| metadata.len()).unwrap_or(0);
     let user_name = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
-    let uid: u32 = {
-        #[cfg(unix)] unsafe { libc::geteuid() as u32 }
-        #[cfg(windows)] { 0 }
-    };
+    // The *effective* user, since that is whose files the daemon will be creating; the
+    // `init` document carries the real user of each invocation. A SID on Windows.
+    let uid: String = crate::user_info::effective_uid();
     // zsh's `$fpath` is the canonical source for shell-installed completion
     // function paths, but probe for zsh on PATH first: without this, every
     // daemon launch pays the cost of a failed `Command::spawn("zsh")` on

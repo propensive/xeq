@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
-use crate::protocol::SignalAck;
+use crate::protocol::{SignalAck, SignalDetail};
 use crate::tty::TtyState;
 
 static SOCKET_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -17,7 +17,7 @@ static TIMEOUT_MS: AtomicU32 = AtomicU32::new(250);
 
 const DEFAULT_TIMEOUT_MS: u32 = 250;
 
-fn forward_signal(name: &str) -> SignalAck {
+fn forward_signal(name: &str, detail: SignalDetail) -> SignalAck {
     if let Some(path) = SOCKET_PATH.get() {
         // UnixStream::connect is not strictly async-signal-safe (allocates),
         // but this matches the pre-existing TcpStream::connect behaviour and
@@ -27,11 +27,21 @@ fn forward_signal(name: &str) -> SignalAck {
             path.as_path(),
             CLIENT_PID.load(Ordering::SeqCst),
             name,
+            detail,
             TIMEOUT_MS.load(Ordering::SeqCst) as u64,
         )
     } else {
         SignalAck::Timeout
     }
+}
+
+// The terminal's size travels with the signals that say it may have changed: WINCH, and
+// CONT, since the window may have been resized while the job was stopped. A POSIX signal
+// carries no payload and the daemon holds no terminal to ask, so this is the only way it
+// can learn the new size. TIOCGWINSZ is async-signal-safe.
+#[cfg(unix)]
+fn sized() -> SignalDetail {
+    SignalDetail { size: crate::tty::terminal_size(), deadline_ms: None }
 }
 
 // Records that the launcher must die once the invocation's streams are drained: by the
@@ -150,7 +160,8 @@ extern "C" fn handler(signal: libc::c_int) {
         libc::SIGCONT => resume(),
         _ => {
             let Some(name) = signal_name(signal) else { return };
-            let ack = forward_signal(name);
+            let detail = if signal == libc::SIGWINCH { sized() } else { SignalDetail::default() };
+            let ack = forward_signal(name, detail);
             if signal == libc::SIGTERM && ack == SignalAck::Accept { flag_termination(signal); }
             match ack {
                 SignalAck::Accept                      => {}
@@ -166,7 +177,7 @@ extern "C" fn handler(signal: libc::c_int) {
 // here, and execution resumes here on SIGCONT, when the handler is put back.
 #[cfg(unix)]
 fn suspend() {
-    let _ = forward_signal("TSTP");
+    let _ = forward_signal("TSTP", SignalDetail::default());
     if RAW_MODE_OWNED.load(Ordering::SeqCst) {
         if let Some(saved) = SAVED_TTY.get() { crate::tty::restore_tty_state(saved); }
     }
@@ -192,7 +203,7 @@ fn resume() {
     if RAW_MODE_OWNED.load(Ordering::SeqCst) && crate::tty::in_foreground() {
         crate::tty::set_raw_mode();
     }
-    let _ = forward_signal("CONT");
+    let _ = forward_signal("CONT", sized());
 }
 
 // The end of a launcher that was told to terminate: the invocation's streams are drained,
@@ -247,12 +258,15 @@ unsafe extern "system" fn console_handler(ctrl_type: u32) -> windows_sys::Win32:
         CTRL_SHUTDOWN_EVENT => "CTRL_SHUTDOWN",
         _ => return 0,
     };
-    let ack = forward_signal(name);
-    if matches!(ctrl_type, CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT)
-        && ack == SignalAck::Accept
-    {
-        flag_termination(CONTROL_EXIT_STATUS);
-    }
+    let ending = matches!(ctrl_type, CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT);
+    // The system ends the process about five seconds after these, whatever it is doing;
+    // the daemon is told, so the application can choose what to finish.
+    let detail = SignalDetail {
+        size: None,
+        deadline_ms: if ending { Some(CONTROL_EVENT_DEADLINE_MS) } else { None },
+    };
+    let ack = forward_signal(name, detail);
+    if ending && ack == SignalAck::Accept { flag_termination(CONTROL_EXIT_STATUS); }
     match ack {
         SignalAck::Accept                      => {}
         SignalAck::Reject | SignalAck::Timeout => fallback(name),
@@ -263,4 +277,26 @@ unsafe extern "system" fn console_handler(ctrl_type: u32) -> windows_sys::Win32:
 #[cfg(windows)]
 pub fn die(code: i32) -> ! {
     std::process::exit(code)
+}
+
+#[cfg(windows)]
+const CONTROL_EVENT_DEADLINE_MS: u64 = 5000;
+
+// Windows has no SIGWINCH. A resize is delivered as a console input record, but reading
+// those would take keystrokes away from stdin, so the screen-buffer size is polled instead
+// and a `WINCH` document sent, with the new size, when it changes.
+#[cfg(windows)]
+pub fn watch_for_resize() {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+    std::thread::spawn(move || {
+        let mut last = crate::tty::terminal_size();
+        loop {
+            std::thread::sleep(POLL);
+            let current = crate::tty::terminal_size();
+            if current.is_some() && current != last {
+                last = current;
+                let _ = forward_signal("WINCH", SignalDetail { size: current, deadline_ms: None });
+            }
+        }
+    });
 }
