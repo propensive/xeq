@@ -21,9 +21,9 @@ pub const MAGIC: [u8; 4] = [0xB2, 0xC4, 0xB5, 0xBB];
 /// The §8 palimpsest signature of the `ethereal-launcher` schema (BLAKE3-256 of its base
 /// component plus the cadence byte), pinned here and in the daemon's tests.
 pub const SIGNATURE: [u8; 33] = [
-    0x47, 0x01, 0xec, 0x19, 0xcd, 0x0f, 0xd3, 0xec, 0xfc, 0x0e, 0x1b, 0x8a, 0x65, 0x25, 0xb4,
-    0xed, 0xc3, 0xa3, 0xb1, 0xde, 0xda, 0x37, 0x0f, 0x68, 0x19, 0x86, 0xdb, 0x9a, 0xa3, 0x9c,
-    0x1d, 0xa6, 0x92,
+    0xee, 0xce, 0xd1, 0x65, 0xc1, 0x5f, 0x73, 0x11, 0x9c, 0xf7, 0x71, 0x08, 0x12, 0x67, 0x19,
+    0x24, 0xaa, 0x55, 0x87, 0x22, 0x92, 0x7d, 0x29, 0xf3, 0x75, 0x38, 0xe7, 0xb3, 0x95, 0x32,
+    0x96, 0xc2, 0xce,
 ];
 
 /// Variant indices of `select Message`, in the schema's declaration order.
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn frames_match_the_daemon_side() {
-        let sig = "4701ec19cd0fd3ecfc0e1b8a6525b4edc3a3b1deda370f681986db9aa39c1da692";
+        let sig = "eeced165c15f73119cf7710812671924aa558722927d29f37538e7b3953296c2ce";
         let mut record = Record::new();
         record.scalar(0, "42");
         assert_eq!(hex(&document(variant::EXIT, record)),
@@ -280,13 +280,17 @@ mod tests {
         record.flag(0);
         assert_eq!(hex(&document(variant::MODE, record)),
                    format!("b2c4b5bb2621{sig}01080100"));
+        // stdout deliberately not a terminal while stdin and stderr are: `command > file`
+        // run from a terminal. An all-true fixture would not catch the three flags being
+        // written in the wrong order or under the wrong indices.
         let info = crate::protocol::ClientInfo {
             pid: 7, user_id: 501, user_name: "jon".into(), script: "/usr/bin/x".into(),
             pwd: "/tmp".into(), args: vec!["a".into(), "b c".into()],
-            env: vec!["K=V".into()], is_tty: true,
+            env: vec!["K=V".into()],
+            stdin_tty: true, stdout_tty: false, stderr_tty: true,
         };
         assert_eq!(hex(&crate::protocol::init_document(&info)),
-                   format!("b2c4b5bb5221{sig}010009000137010335303102036a6f6e030a2f7573722f62696e2f7804042f746d7005060161060362206307034b3d56"));
+                   format!("b2c4b5bb5321{sig}01000a000137010335303102036a6f6e030a2f7573722f62696e2f7804042f746d700507080161080362206309034b3d56"));
     }
 
     #[test]

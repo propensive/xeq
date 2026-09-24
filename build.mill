@@ -394,6 +394,11 @@ object xeq extends Module:
   // end-to-end test to exist. It is deliberately outside every aggregate — nothing published
   // from this repository depends on it, and `mill xeq.packager.compile` and the test suite never
   // resolve it. `make e2e` is what builds it.
+  //
+  // Like every module here it compiles against the Soundness *release* in etc/refs, so it may
+  // not use daemon API that only the next Soundness release will have (AGENTS.md, rule 6):
+  // Soundness pins XEQ's release, and a fixture that needed unreleased Soundness would leave
+  // neither side able to release first.
   object example extends Component():
     def mvnDeps = Task(settings.Soundness(deps.soundness()).example)
     override def artifactName = Task("xeq-example")

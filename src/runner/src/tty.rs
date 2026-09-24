@@ -1,6 +1,8 @@
 #[cfg(unix)]
 use std::io::Write;
 
+use std::io::IsTerminal;
+
 #[cfg(unix)]
 #[derive(Clone, Copy)]
 pub struct TtyState {
@@ -16,20 +18,20 @@ pub struct TtyState {
     is_tty: bool,
 }
 
-#[cfg(unix)]
-pub fn stdin_is_tty() -> bool {
-    unsafe { libc::isatty(libc::STDIN_FILENO) != 0 }
-}
+// The three descriptors are independent — `cmd > file` leaves stdin on the
+// terminal while stdout is a file — so each is asked separately. The daemon
+// cannot ask for itself: its streams are the socket, not the client's terminal,
+// so whatever is learned here is the only answer it will ever have.
+//
+// `is_terminal` is `isatty` on Unix and `GetConsoleMode` on Windows, plus a
+// check for the MSYS/Cygwin pseudo-terminals that a bare `GetConsoleMode` calls
+// pipes.
 
-#[cfg(windows)]
-pub fn stdin_is_tty() -> bool {
-    use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE};
-    unsafe {
-        let h = GetStdHandle(STD_INPUT_HANDLE);
-        let mut mode: u32 = 0;
-        GetConsoleMode(h, &mut mode) != 0
-    }
-}
+pub fn stdin_is_tty() -> bool { std::io::stdin().is_terminal() }
+
+pub fn stdout_is_tty() -> bool { std::io::stdout().is_terminal() }
+
+pub fn stderr_is_tty() -> bool { std::io::stderr().is_terminal() }
 
 // The launcher must know the real terminal size so it can forward it to the
 // daemon (which only sees a socket and cannot query the tty itself). Querying
@@ -59,7 +61,11 @@ pub fn query_bg_color(timeout: std::time::Duration) -> (Option<String>, Vec<u8>)
     use std::os::fd::AsRawFd;
     use std::time::Instant;
 
-    if !stdin_is_tty() { return (None, Vec::new()); }
+    // The query goes out on stdout and the reply comes back on stdin, so unless
+    // both are the terminal the handshake cannot complete — and writing it to a
+    // redirected stdout would prepend eight bytes of escape sequence to the
+    // invocation's output.
+    if !(stdin_is_tty() && stdout_is_tty()) { return (None, Vec::new()); }
 
     let mut stdout = std::io::stdout();
     if stdout.write_all(b"\x1b]11;?\x1b\\").is_err() { return (None, Vec::new()); }

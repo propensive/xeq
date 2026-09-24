@@ -4,8 +4,8 @@
 # result, and require it to say hello.
 #
 # This is the only stage that exercises the whole chain at once — a stub built (or fetched)
-# from this repository, an `ETHRCFG` block patched by `xeq.Assembler`, an application JAR
-# appended, a daemon started over the launcher protocol, and its output carried back. It is
+# from this repository, an `ETHRCFG` record and an application JAR joined to it by the `xeq`
+# builder script, a daemon started over the launcher protocol, and its output carried back. It is
 # also the only stage that needs a daemon implementation, which is why it lives here and not in
 # the test suite.
 #

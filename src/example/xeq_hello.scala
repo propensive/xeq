@@ -54,6 +54,13 @@ import threading.virtualThreading
 // here as a *test peer*: the launcher's other end has to be something for an end-to-end test
 // to exist. Nothing published from this repository depends on it — see the `example` module in
 // `build.mill`, which is outside every aggregate.
+//
+// It uses only the API of the Soundness *release* pinned in `etc/refs`, never of an unreleased
+// daemon: Soundness pins this repository's release in its `etc/xeq.tsv`, so a fixture here
+// that needed the daemon's next release would make the two unable to release at all. What a
+// new protocol field actually does (say, the per-stream terminal flags of `xeq-0.7`) is
+// asserted in Soundness's `ethereal` suite, which runs against a locally built stub; this
+// fixture only has to say hello.
 @main
 def hello(): Unit = cli:
   execute:

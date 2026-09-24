@@ -347,7 +347,12 @@ fn run_non_interactive(socket_file: &Path, script: &Path, args: &[String]) -> i3
 }
 
 impl ClientInfo {
-    pub fn collect(script: &Path, args: &[String], is_tty: bool, bg_color: Option<&str>) -> Self {
+    pub fn collect(
+        script: &Path,
+        args: &[String],
+        stdin_tty: bool,
+        bg_color: Option<&str>,
+    ) -> Self {
         let size = tty::terminal_size();
         let mut env: Vec<String> = env::vars_os()
             .filter(|(name, _)| {
@@ -385,7 +390,13 @@ impl ClientInfo {
                 .unwrap_or_default(),
             args: args.to_vec(),
             env,
-            is_tty,
+            // Whether stdin is a terminal is passed in rather than probed here: the
+            // non-interactive path deliberately reports `false` even from a terminal, so
+            // that `cooked` blocks do not wait on a control channel it never opens. Nothing
+            // makes the output streams worth lying about, so those are asked directly.
+            stdin_tty,
+            stdout_tty: tty::stdout_is_tty(),
+            stderr_tty: tty::stderr_is_tty(),
         }
     }
 }
