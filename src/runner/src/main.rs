@@ -60,6 +60,13 @@ fn main() {
     let (script, args, download) = parse_arguments();
     let name = script.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     debug!("main: script={} name={} args={:?}", script.display(), name, args);
+    // This path is handed to the JVM as the JAR, and `update` renames it. A resolution that
+    // landed on a directory or a missing file must stop here, legibly, rather than surface
+    // downstream as `Invalid or corrupt jarfile` — or as a rename of whatever it hit.
+    if !script.is_file() {
+        eprintln!("{name}: could not locate its own executable — {} is not a file", script.display());
+        std::process::exit(1);
+    }
     // The configuration record follows the stub in this very file (spec/ethrcfg.md); read it
     // once, before anything consults the build id or the public key.
     let build_config = config::load(&script);
@@ -212,10 +219,36 @@ fn parse_arguments() -> (PathBuf, Vec<String>, bool) {
     for arg in raw.iter().skip(1) {
         if arg == "--download" { download = true; } else { args.push(arg.clone()); }
     }
-    let script = std::fs::canonicalize(&executable)
-        .or_else(|_| std::env::current_exe())
-        .unwrap_or_else(|_| PathBuf::from(&executable));
+    let script = resolve_script(&executable, std::env::current_exe().ok());
     (strip_extended_prefix(script), args, download)
+}
+
+// The file the runner hands the JVM is its OWN executable — stub, record and JAR are one file
+// (spec/ethrcfg.md) — so ask the operating system for it. argv[0] cannot answer: a $PATH
+// lookup leaves a bare name there, and canonicalizing a bare name resolves it against the
+// CURRENT DIRECTORY, so a launcher run beside anything of the same name launched that instead
+// (`Invalid or corrupt jarfile …`), and `update::check_updates` would have renamed it.
+//
+// `current_exe` is taken as an argument rather than read here so that the fallback arm below,
+// which is unreachable in practice, is still testable.
+fn resolve_script(executable: &str, current_exe: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = current_exe { return path; }
+
+    // `current_exe` fails only in exotic cases — the binary unlinked mid-run, or /proc not
+    // mounted. Fall back to argv[0], read the way `execvp` reads it: a name with no separator
+    // came from $PATH and is not a relative path.
+    if argv0_is_path(executable) {
+        if let Ok(path) = std::fs::canonicalize(executable) { return path; }
+    } else if let Some(path) = java::which(executable) {
+        return path;
+    }
+
+    PathBuf::from(executable)
+}
+
+// True when argv[0] names a path rather than a command found on $PATH.
+fn argv0_is_path(executable: &str) -> bool {
+    Path::new(executable).parent().is_some_and(|parent| !parent.as_os_str().is_empty())
 }
 
 // On Windows, `std::fs::canonicalize` returns the extended-length form
@@ -382,5 +415,62 @@ fn debug_log(message: impl AsRef<str>) {
     let log_path = std::env::temp_dir().join("ethereal-launcher.log");
     if let Ok(mut log_file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
         let _ = writeln!(log_file, "[{}] {}", std::process::id(), message.as_ref());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_name_is_not_a_path_but_anything_with_a_separator_is() {
+        assert!(!argv0_is_path("flame"));
+        assert!(argv0_is_path("./flame"));
+        assert!(argv0_is_path("bin/flame"));
+        assert!(argv0_is_path("/usr/local/bin/flame"));
+    }
+
+    // The regression: argv[0] is a bare `flame` after a $PATH lookup, and the working
+    // directory holds something of that name. `Cargo.toml` stands in for it — cargo runs
+    // tests with the crate root as the working directory, so it is a real neighbour, and no
+    // test needs to write a file or move the (process-wide) working directory to prove it.
+    #[test]
+    fn a_bare_name_never_resolves_against_the_working_directory() {
+        let exe = PathBuf::from("/opt/xeq/bin/flame");
+        let neighbour = std::env::current_dir().unwrap().join("Cargo.toml");
+        assert!(neighbour.is_file(), "expected the crate root as the test working directory");
+
+        let resolved = resolve_script("Cargo.toml", Some(exe.clone()));
+        assert_eq!(resolved, exe);
+        assert_ne!(resolved, neighbour);
+
+        // …and with no `current_exe` to fall back on, it is still not the neighbour.
+        assert_ne!(resolve_script("Cargo.toml", None), neighbour);
+    }
+
+    #[test]
+    fn the_running_executable_wins_over_a_path_shaped_argv0() {
+        let exe = PathBuf::from("/opt/xeq/bin/flame");
+        assert_eq!(resolve_script("./Cargo.toml", Some(exe.clone())), exe);
+    }
+
+    #[test]
+    fn without_current_exe_a_path_shaped_argv0_is_canonicalized() {
+        let expected = std::fs::canonicalize("Cargo.toml").unwrap();
+        assert_eq!(resolve_script("./Cargo.toml", None), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_current_exe_a_bare_name_is_looked_up_on_the_path() {
+        let resolved = resolve_script("sh", None);
+        assert!(resolved.is_absolute(), "expected a $PATH hit, got {}", resolved.display());
+        assert_eq!(resolved.file_name().unwrap(), "sh");
+    }
+
+    #[test]
+    fn an_unresolvable_argv0_is_returned_unchanged() {
+        let missing = "xeq-no-such-command-9f3a1c";
+        assert_eq!(resolve_script(missing, None), PathBuf::from(missing));
     }
 }

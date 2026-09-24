@@ -59,3 +59,29 @@ if [[ "$ACTUAL" != "Hello world" ]]; then
 fi
 
 echo "e2e: ok — $OUT printed '$ACTUAL'"
+
+# A launcher must run its OWN bytes whatever the working directory holds. The shell leaves a
+# bare name in argv[0] after a $PATH lookup, and resolving that name against the working
+# directory picks up any same-named neighbour instead — which the JVM then rejects as an
+# invalid JAR. See `resolve_script` in src/runner/src/main.rs.
+echo "e2e: checking a \$PATH invocation shadowed by a same-named directory"
+
+SHADOW=$(mktemp -d)
+trap 'rm -rf "$SHADOW"' EXIT
+
+# A distinct name, so this stage gets its own daemon and state directory rather than
+# disturbing the one the check above just started.
+mkdir -p "$SHADOW/bin" "$SHADOW/cwd/hellopath"
+cp "$OUT" "$SHADOW/bin/hellopath"
+
+SHADOWED=$(cd "$SHADOW/cwd" && PATH="$SHADOW/bin:$PATH" hellopath)
+
+pkill -f 'ethereal.name=hellopath' >/dev/null 2>&1 || true
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/hellopath" "${XDG_RUNTIME_DIR:-/nonexistent}/hellopath"
+
+if [[ "$SHADOWED" != "Hello world" ]]; then
+  echo "e2e: shadowed by \$PWD/hellopath — expected 'Hello world', got '$SHADOWED'" >&2
+  exit 1
+fi
+
+echo "e2e: ok — a shadowed \$PATH invocation printed '$SHADOWED'"

@@ -3,6 +3,11 @@ use std::path::Path;
 use crate::config::FLAG_DOWNGRADE_PERMITTED;
 
 pub fn check_updates(script: &Path, args: &[String], name: &str) {
+    // `script` is renamed below. `main` has already refused to run if it is not a regular
+    // file; repeat the check here so the rename can never reach a directory or a stray
+    // same-named neighbour, whatever a future caller does.
+    if !script.is_file() { return; }
+
     let data_home = crate::state::data_home();
     let pending = data_home.join(name).join(".pending");
     crate::debug!("update: pending={}", pending.display());
