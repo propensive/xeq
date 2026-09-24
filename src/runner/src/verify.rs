@@ -1,9 +1,7 @@
 use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsa44, Signature, VerifyingKey,
              signature::Verifier};
 
-use crate::config::{
-    MAGIC, MAGIC_LEN, PUBKEY_LEN, RECORD_LEN, SIGNATURE_LEN, SIGNATURE_OFFSET,
-};
+use crate::config::{PUBKEY_LEN, RECORD_LEN, SIGNATURE_LEN, SIGNATURE_OFFSET, find_record};
 
 #[derive(Debug)]
 pub enum VerifyError {
@@ -21,18 +19,11 @@ pub struct VerifiedBinary {
     pub flags:    u8,
 }
 
-// Locate the ETHRCFG magic in `binary`. Searches forwards; only the first
-// occurrence is honoured (the marker is rare enough in optimised binaries
-// that this is unambiguous in practice).
-fn find_magic(binary: &[u8]) -> Option<usize> {
-    if binary.len() < MAGIC_LEN { return None; }
-    binary.windows(MAGIC_LEN).position(|w| w == MAGIC)
-}
-
 // Verify a candidate upgrade binary against the runner's baked-in public key.
 //
 // Algorithm:
-//   1. Locate the ETHRCFG magic in `pending`.
+//   1. Locate the ETHRCFG record in `pending` — the first magic, which is the record a
+//      builder appended after the stub (a stub itself contains no magic).
 //   2. Extract the embedded signature bytes from that block.
 //   3. Make a working copy of the binary with the signature slot zeroed.
 //   4. Verify the signature over the zeroed copy using the running runner's
@@ -50,7 +41,9 @@ pub fn verify_pending(
         return Err(VerifyError::PublicKeyUnset);
     }
 
-    let magic_offset = find_magic(pending).ok_or(VerifyError::MagicMissing)?;
+    // `find_record` only reports a magic with a whole record behind it, so a magic in the
+    // file's last 3764 bytes reads as missing rather than truncated.
+    let magic_offset = find_record(pending).ok_or(VerifyError::MagicMissing)?;
     let block_end = magic_offset + RECORD_LEN;
     if pending.len() < block_end { return Err(VerifyError::Truncated); }
 
@@ -85,6 +78,7 @@ pub fn verify_pending(
 #[cfg(all(test, feature = "sign"))]
 mod tests {
     use super::*;
+    use crate::config::{MAGIC_LEN, magic};
     use ml_dsa::{B32, Keypair, SigningKey, signature::Signer};
     use rand::{TryRngCore, rngs::OsRng};
 
@@ -100,7 +94,7 @@ mod tests {
     fn make_fake_binary(magic_offset: usize, build_id: u64, flags: u8,
                         pk: &[u8; PUBKEY_LEN]) -> Vec<u8> {
         let mut bin = vec![0xAAu8; magic_offset + RECORD_LEN + 1024];
-        bin[magic_offset..magic_offset + MAGIC_LEN].copy_from_slice(&MAGIC);
+        bin[magic_offset..magic_offset + MAGIC_LEN].copy_from_slice(&magic());
         bin[magic_offset + 8 .. magic_offset + 16]
             .copy_from_slice(&build_id.to_le_bytes());
         bin[magic_offset + 21] = flags;
@@ -200,6 +194,20 @@ mod tests {
 
         assert!(matches!(verify_pending(&bin, &pk_other),
                          Err(VerifyError::SignatureMismatch)));
+    }
+
+    #[test]
+    fn record_after_stub_with_decoy_magic_in_jar() {
+        // The v3 shape: a magic-free stub, the record, then a JAR that happens to contain the
+        // magic bytes. The first magic is the record, and the signature covers everything.
+        let (sk, pk) = fresh_keypair();
+        let mut bin = make_fake_binary(0x400, 11, 0, &pk);
+        bin.extend_from_slice(&magic());
+        bin.extend_from_slice(&[0x77u8; RECORD_LEN]);
+        sign_in_place(&mut bin, &sk, 0x400);
+
+        let v = verify_pending(&bin, &pk).expect("verify");
+        assert_eq!(v.build_id, 11);
     }
 
     #[test]

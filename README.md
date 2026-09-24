@@ -9,8 +9,8 @@ the JVM's startup cost is paid once rather than once per invocation, and the com
 like any other command: it reads a pipe, respects `Ctrl-C`, and reports a status.
 
 The stub is generic and reusable. It is the same bytes for every application on a given
-platform, so building an executable is byte-patching a configuration block and concatenating a
-JAR — not compiling. That is what makes cross-platform packaging cheap: every platform's
+platform, so building an executable is joining three files — the stub, a small configuration
+record and the JAR — not compiling. That is what makes cross-platform packaging cheap: every platform's
 executable can be built on one machine, in about as long as it takes to copy a file.
 
 ```sh
@@ -26,8 +26,8 @@ mytool 1.0.0
 |---|---|
 | `src/runner` | The runner stub, in Rust: platform detection, JVM discovery, the daemon handshake, terminal modes, signals, and signed self-upgrade. ~0.5 MB per platform |
 | `src/sign` | `ethereal-sign` — keygen and signing for the self-upgrade path |
-| `src/core` | The polyglot script generator: one file that is simultaneously a valid `sh` script, a `.bat` file and a PowerShell script |
-| `src/packager` | `Packager` — turning a `Packaging` into a distributable, and `Assembler`, which patches a stub's configuration block and appends a JAR |
+| `src/script` | The `xeq` builder: a polyglot script (one file valid as `sh`, `.bat` and PowerShell) that joins a stub, a record and a JAR, and generates the polyglot launchers. Published with the runners |
+| `src/packager` | `Packager` — a thin front end that turns a `Packaging` into a distributable by invoking the `xeq` script |
 | `src/toolchain` | The same packaging as an [Anthology](https://github.com/propensive/soundness) toolchain format, so an application compiles and packages in one pass |
 | `spec/` | **The contract** between a launcher and a daemon, and the reason the two can be developed apart |
 | `src/example` | The end-to-end fixture: the smallest daemonized application there is |
@@ -70,7 +70,8 @@ Requires a JDK, and — to build stubs rather than download them — a Rust tool
 [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) and `zig` for cross-compiling.
 
 ```sh
-make build           # the Scala modules
+make xeq-script      # assemble dist/xeq, the builder
+	make build           # the Scala modules
 make test            # the test suite, through the `fume` runner
 make cargo-test      # the runner's own unit tests
 
@@ -92,17 +93,17 @@ Stubs are published on their own cadence, and only when the Rust source changes:
 make runners-release RUNNERS_VERSION=0.6
 ```
 
-which cross-compiles the five stubs, uploads them to a `runners-0.6` release, records their
-hashes in `etc/runners/0.6.tsv`, and rewrites `res/packager/xeq/runners.{tsv,version,url}` —
-the resources the packager reads. Publishing is therefore a data change, not a code change, and
+which cross-compiles the five stubs, assembles the `xeq` builder script, uploads them all to a
+`xeq-0.6` release, records their hashes in `etc/runners/0.6.tsv` and `etc/runners/0.6.SHA256SUMS`,
+and rewrites `res/packager/xeq/runners.{tsv,version,url}` — the resources the packager reads. Publishing is therefore a data change, not a code change, and
 an application picks up a runner fix without anything being rebuilt.
 
 ## Status
 
 Extracted from Soundness, where this machinery grew as the `ziggurat` library and the Rust
 runner inside `ethereal`. Runner releases up to `runners-0.5` were published from that
-repository; the manifest currently shipped still names them, and the first release made from
-here supersedes it.
+repository under the `runners-` tag prefix; releases from here use `xeq-`, and `xeq-0.6` — the
+first made from this repository — supersedes them and adds the builder script as a release asset.
 
 ## Licence
 

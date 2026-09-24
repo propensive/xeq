@@ -33,165 +33,125 @@ package xeq
 
 import ambience.*
 import anticipation.*
-import denominative.dysasymptotics.linearSize
-import denominative.size
 import aperture.*
 import contingency.*
 import distillate.*
+import denominative.size
+import denominative.dysasymptotics.linearSize
 import eucalyptus.*
 import fulminate.*
 import galilei.*, galilei.Platform.pathReadable
 import gossamer.*
+import guillotine.*
+import hieroglyph.*
 import prepositional.*
 import rudiments.*
 import serpentine.*
 import spectacular.*
-import telekinesis.*
 import turbulence.*
-import urticose.*
 import vacuous.*
+
+import environments.javaBaseEnvironment
 import errorDiagnostics.emptyDiagnostics
-import gastronomy.*, providers.javaBaseProvider
-import httpBackends.javaNetHttp
-import internetAccess.online
-import monotonous.*, alphabets.hexLowerCase
+import logging.silentLogging
+
+import filesystemOptions.createNonexistentParents
+import filesystemOptions.dereferenceSymlinks
+import filesystemOptions.overwritePreexisting
 
 import filesystemBackends.javaBaseFilesystem
 
-// Turns a `Packaging` configuration into a distributable. Each per-platform binary is the
-// application JAR appended to a bare reusable runner stub, obtained from `RunnerSource` —
-// read from a local directory, or downloaded and SHA-256-verified against the manifest.
-// `Native` emits one self-contained binary; `EmbedAll` emits a polyglot script embedding
-// every (ETHRCFG-patched) stub plus the JAR once (`Xeq.installer`); `Download` emits a
-// polyglot launcher. Burdock remote dependencies remain unimplemented.
+// Turns a `Packaging` into a distributable by invoking the published `xeq` builder script —
+// the single implementation of the ETHRCFG v3 format and the polyglot launchers
+// (`src/script`, `spec/ethrcfg.md`). The script is located from the `XEQ` environment
+// variable, else `dist/xeq` under the working directory. `Native` runs `xeq build`, `EmbedAll`
+// runs `xeq embed-all`, `Download` runs `xeq download`; each delivery's flags come straight
+// from the `Packaging` fields.
+//
+// Nothing here reimplements the byte format: the split's whole point is that one script,
+// released with the runners, does the joining, and this is a thin front end over it so an
+// Anthology build reaches the same code a shell user does.
 object Packager:
-  // The embedded JAR payload's label — must match the launcher templates' `get_offset "data"`.
-  private val DataName: Text = t"data"
-
   def pack(config: Packaging)(using WorkingDirectory): Path on Linux raises Packager.Error =
     val appJar: Path on Linux = config.dependencies.absolve match
-      case Packaging.Dependencies.FatJar(jar) =>
-        jar
-
+      case Packaging.Dependencies.FatJar(jar) => jar
       case Packaging.Dependencies.BurdockRemote(_) =>
         abort(Packager.Error(m"Burdock remote dependencies are not yet supported (Stage C)"))
 
     config.delivery match
       case Packaging.Delivery.Native if config.targets.size != 1 =>
         val length: Int = config.targets.size
+        abort(Packager.Error(m"Native delivery requires exactly one target, but $length were given"))
+      case _ => ()
 
-        abort:
-          Packager.Error(m"Native delivery requires exactly one target, but $length were given")
+    val subcommand: Text = config.delivery match
+      case Packaging.Delivery.Native   => t"build"
+      case Packaging.Delivery.EmbedAll => t"embed-all"
+      case Packaging.Delivery.Download => t"download"
 
-      case _ =>
-        ()
+    // The remote runner source's per-label hashes reach the script as a temporary manifest in
+    // the `label<TAB>sha256` format `etc/runners/<v>.tsv` uses; a local directory is passed
+    // straight through. A missing hash is caught here, before the script runs, so the error
+    // matches the pre-shell-out behaviour the tests pin.
+    val runnerArgs: List[Text] = config.runnerSource.absolve match
+      case Packaging.RunnerSource.Local(directory) =>
+        List(t"--runners", directory.encode)
 
+      case Packaging.RunnerSource.Remote(baseUrl, hashes) =>
+        config.targets.each: label =>
+          hashes(label).lest(Packager.Error(m"No runner hash given for $label"))
+
+        val manifest: Path on Linux = temporaryManifest(hashes, config.output)
+        List(t"--runners-url", baseUrl, t"--runners-manifest", manifest.encode)
+
+    val args = scala.collection.mutable.ListBuffer[Text]()
+    args += resolveScript.encode
+    args += subcommand
+    args += t"--jar"; args += appJar.encode
+    args += t"--out"; args += config.output.encode
+    config.targets.each { label => args += t"--target"; args += label }
+    args += t"--java-min";  args += config.java.minimum.show
+    args += t"--java-pref"; args += config.java.preferred.show
+    args += t"--build-id";  args += config.buildId.show
+    if config.java.bundle == Packaging.Bundle.Jdk then args += t"--jdk"
+    config.signing.let(_.publicKey).let { path => args += t"--public-key"; args += path.encode }
+    if config.signing.let(_.allowDowngrade).or(false) then args += t"--allow-downgrade"
+    runnerArgs.each(args += _)
+
+    val exit: Exit =
+      mitigate:
+        case Exec.Error(_, _, _) => Packager.Error(m"Could not run the xeq builder script")
+      . protect:
+          Command(args.toList*).exec[Exit]()
+
+    exit match
+      case Exit.Ok         => config.output
+      case Exit.Fail(code) =>
+        abort(Packager.Error(m"The xeq builder exited with status $code (see its output above)"))
+
+  // Locate the builder script: `$XEQ`, else `dist/xeq` under the working directory. Absent, a
+  // clear instruction rather than a download — every in-repo caller (tests, `make e2e`) has run
+  // `make xeq-script`, and a downstream build sets `XEQ` to the release asset it fetched.
+  private def resolveScript(using WorkingDirectory): Path on Linux raises Packager.Error =
+    safely(Environment.xeq[Text].as[Path on Linux]).or:
+      val work: Path on Linux = workingDirectory
+      val candidate: Path on Linux = unsafely(t"${work.encode}/dist/xeq".as[Path on Linux])
+      if candidate.existent() then candidate
+      else abort(Packager.Error(m"No xeq builder found: set XEQ or run `make xeq-script` to write dist/xeq"))
+
+  // A temporary manifest for the script, beside the output so it shares its writable directory.
+  private def temporaryManifest(hashes: Map[Text, Text], output: Path on Linux)
+  :   Path on Linux raises Packager.Error =
     mitigate:
-      case Http.Error(_, _)        => Packager.Error(m"A runner stub could not be downloaded")
-      case Connect.Error(_)         => Packager.Error(m"Could not connect to download a runner stub")
-      case Url.Error(_, _, _)      => Packager.Error(m"A runner stub URL is invalid")
-      case Assembler.Error(detail) => Packager.Error(detail)
-      case Io.Error(_, _, _, _)     => Packager.Error(m"A filesystem error occurred when packaging")
-      case Truncation.Error(_)          => Packager.Error(m"A stream error occurred during packaging")
-      case Path.Error(_, _)        => Packager.Error(m"A path could not be resolved when packaging")
-
+      case Io.Error(_, _, _, _) => Packager.Error(m"Could not write a temporary runner manifest")
+      case Truncation.Error(_)  => Packager.Error(m"Could not write a temporary runner manifest")
     . protect:
-        val jdk: Boolean = config.java.bundle == Packaging.Bundle.Jdk
-
-        val publicKey: Data =
-          val zeros: Data = Array.fill(Assembler.PublicKeyLength)(0.toByte)
-
-          config.signing.lay(zeros): signing =>
-            signing.publicKey.lay(zeros): key =>
-              val raw: Data = key.read[Data]
-
-              if raw.length != Assembler.PublicKeyLength
-              then abort(Packager.Error(m"The signing public key is the wrong size"))
-
-              raw
-
-        // The bare reusable stub bytes for a platform — read from a local directory, or
-        // downloaded and verified against the manifest hash.
-        def stub(label: Text): Data =
-          val name: Text =
-            if label.starts(t"windows") then t"runner-$label.exe" else t"runner-$label"
-
-          config.runnerSource.absolve match
-            case Packaging.RunnerSource.Local(directory) =>
-              val file: Path on Linux = t"$directory/$name".as[Path on Linux]
-              file.read[Data]
-
-            case Packaging.RunnerSource.Remote(baseUrl, hashes) =>
-              val expected: Text =
-                hashes(label).lest(Packager.Error(m"No runner hash given for $label"))
-
-              val base: Text = if baseUrl.ends(t"/") then baseUrl else t"$baseUrl/"
-              val runner: Data = mute[Http.Event](t"$base$name".as[HttpUrl].fetch().read[Data])
-              val actual: Text = runner.digest[Sha2[256]].serialize[Hex]
-
-              if actual != expected
-              then abort(Packager.Error(m"The runner for $label has the wrong SHA-256 ($actual)"))
-
-              runner
-
-        // One self-contained per-platform binary: bare stub, ETHRCFG patched, JAR appended.
-        def binary(label: Text, output: Path on Linux): Unit =
-          Assembler.assemble
-            ( stub(label), appJar, output, label, config.buildId, config.java.minimum,
-              config.java.preferred, jdk, publicKey )
-
-        config.delivery match
-          case Packaging.Delivery.Native =>
-            binary
-              ( config.targets.prim.lest(Packager.Error(m"no target was given")),
-                config.output )
-            config.output
-
-          case Packaging.Delivery.EmbedAll =>
-            val stubs: List[Payload] = config.targets.map: label =>
-              val patched: Data =
-                Assembler.patch
-                  ( stub(label), config.buildId, config.java.minimum, config.java.preferred, jdk,
-                    publicKey )
-
-              Payload(label, patched, gzip = !label.starts(t"windows"))
-
-            val data: Payload = Payload(DataName, appJar.read[Data], gzip = false)
-            write(config.output, Xeq.installer(stubs :+ data))
-            config.output
-
-          case Packaging.Delivery.Download =>
-            // Online: the JAR is embedded once; the launcher downloads each bare stub from the
-            // `Remote` base URL at runtime and appends the embedded JAR. No per-platform binary
-            // is built or published here — only the reusable stubs (published independently).
-            val entries: List[(Text, Text, Text)] = config.runnerSource.absolve match
-              case Packaging.RunnerSource.Local(_) =>
-                abort(Packager.Error(m"Download delivery requires a Remote runner source"))
-
-              case Packaging.RunnerSource.Remote(baseUrl, hashes) =>
-                val base: Text = if baseUrl.ends(t"/") then baseUrl else t"$baseUrl/"
-
-                config.targets.map: label =>
-                  val name: Text =
-                    if label.starts(t"windows") then t"runner-$label.exe" else t"runner-$label"
-
-                  val hash: Text =
-                    hashes(label).lest(Packager.Error(m"No runner hash given for $label"))
-
-                  (label, t"$base$name", hash)
-
-            val jarData: Data = appJar.read[Data]
-            write(config.output, Xeq.onlineLauncher(jarData, entries))
-            config.output
-
-
-  private def write(output: Path on Linux, data: Data)
-  :   Unit raises Io.Error raises Truncation.Error =
-
-    output.create[File](CreateFlag.Parents, CreateFlag.Replace): handle ?=>
-      handle.write(Chain(data))
-
-    output.executable() = true
+        val body: Text = hashes.to[List].map((label, hash) => t"$label\t$hash").join(t"\n")
+        val dir: Path on Linux = unsafely(output.parent.assume)
+        val path: Path on Linux = unsafely(t"${dir.encode}/.xeq-manifest.tsv".as[Path on Linux])
+        path.open[File](Write, OpenFlag.Create, OpenFlag.Truncate):
+          file.write(Chain(body.in[Data](using charEncoders.utf8Encoder)))
+        path
 
   // PackageError → Packager.Error
   case class Error(detail: Message)(using Diagnostics) extends fulminate.Error(detail)

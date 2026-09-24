@@ -60,7 +60,9 @@ fn main() {
     let (script, args, download) = parse_arguments();
     let name = script.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     debug!("main: script={} name={} args={:?}", script.display(), name, args);
-    let build_config = config::read_config();
+    // The configuration record follows the stub in this very file (spec/ethrcfg.md); read it
+    // once, before anything consults the build id or the public key.
+    let build_config = config::load(&script);
     debug!("main: build_id={} java_min={} java_pref={}", build_config.build_id, build_config.java_min, build_config.java_pref);
 
     update::check_updates(&script, &args, &name);

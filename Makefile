@@ -6,7 +6,7 @@
 
 MILL = ./mill
 
-.PHONY: build test cargo-test runners-build runners-fetch runners-release publishLocal sync-deps tools e2e clean
+.PHONY: build test cargo-test runners-build runners-fetch runners-release xeq-script publishLocal sync-deps tools e2e clean
 
 # Everything published from this repository. `example` is deliberately excluded: it is the
 # end-to-end fixture, and the only module that depends on a daemon implementation.
@@ -15,9 +15,9 @@ build:
 
 # Suites carry no `main`; a host runner discovers them from the `META-INF/services/probably.Suite`
 # index and drives them over the test-event protocol. `$(TESTS)` are fume selection terms.
-test:
+test: xeq-script
 	$(MILL) xeq.test.assembly
-	fume run -c out/xeq/test/assembly.dest/out.jar $(TESTS)
+	XEQ=$(PWD)/dist/xeq fume run -c out/xeq/test/assembly.dest/out.jar $(TESTS)
 
 # The runner's own unit tests — the BinTEL codec, the ETHRCFG verifier, the state machine.
 cargo-test:
@@ -48,6 +48,16 @@ sync-deps:
 tools:
 	./etc/shared tools.sh
 
+# Assemble the polyglot `xeq` builder script (dist/xeq and dist/xeq.cmd) from its three shell
+# sections and the launcher templates, baking in the version, base URL and stub hashes read
+# from res/packager/xeq/runners.{version,url,tsv}. `make test` and `make e2e` depend on this.
+xeq-script:
+	./etc/ci/xeq-script-build.sh \
+	  "$$(cat res/packager/xeq/runners.version)" \
+	  "$$(cat res/packager/xeq/runners.url)" \
+	  res/packager/xeq/runners.tsv \
+	  dist/xeq
+
 # Install the jars into ~/.ivy2/local, where coursier finds them with no repository
 # configuration — how a downstream build consumes XEQ before it has a published home.
 publishLocal:
@@ -58,7 +68,7 @@ publishLocal:
 # The end-to-end check: package the example application around a real runner stub and run it.
 # Needs dist/runners (from `runners-build` or `runners-fetch`), and resolves a daemon
 # implementation — the one place anything here does.
-e2e:
+e2e: xeq-script
 	./etc/ci/e2e.sh
 
 clean:

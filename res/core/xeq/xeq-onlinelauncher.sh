@@ -13,6 +13,26 @@ case "$arch" in
 esac
 
 label="${os}-${arch}"
+# Add $2 to a ZIP64 EOCD locator's physical offset in file $1, if present.
+xeq_rebase_zip64() {
+  file=$1; delta=$2
+  size=$(wc -c < "$file" | tr -d ' ')
+  n=65557; [ "$size" -lt "$n" ] && n=$size
+  hex=" $(tail -c "$n" "$file" | od -An -v -tx1 | tr -s ' \n' ' ')"
+  before=${hex% 50 4b 05 06*}
+  [ "$before" = "$hex" ] && return 0
+  eocd=$(( size - n + (${#before} - 1) / 3 ))
+  [ "$eocd" -ge 20 ] || return 0
+  sig=$(dd if="$file" bs=1 skip=$((eocd - 20)) count=4 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
+  [ "$sig" = "504b0607" ] || return 0
+  old=0; i=7
+  set -- $(dd if="$file" bs=1 skip=$((eocd - 12)) count=8 2>/dev/null | od -An -v -tu1)
+  while [ "$i" -ge 0 ]; do eval "b=\${$((i + 1))}"; old=$(( (old << 8) + b )); i=$((i - 1)); done
+  new=$((old + delta)); s=''; i=0
+  while [ "$i" -lt 8 ]; do s=$s$(printf '\\%03o' $(( (new >> (8*i)) & 255 ))); i=$((i+1)); done
+  printf '%b' "$s" | dd of="$file" bs=1 seek=$((eocd - 12)) count=8 conv=notrunc 2>/dev/null
+}
+
 s=$(realpath "$0")
 row=$(sed -n 's/^assets://p' "$s" | head -1 | tr ',' '\n' | grep "^${label}=" | head -1)
 if [ -z "$row" ]
@@ -48,8 +68,18 @@ data_offset=$(printf '%s\n' "$indexcontent" | tr ',' '\n' | grep "^data=" | cut 
 if [ -z "$data_offset" ]
 then printf 'No embedded data payload\n' >&2; rm -f "$t"; exit 1
 fi
+stubsize=$(wc -c < "$t" | tr -d ' ')
+record_offset=$(printf '%s\n' "$indexcontent" | tr ',' '\n' | grep "^record=" | cut -d= -f2)
+recsize=0
+if [ -n "$record_offset" ]
+then
+  rabs=$((indexnum + record_offset + 1))
+  tail -n +"$rabs" "$s" | sed -n '/^-----END/q; p' | { base64 -d 2>/dev/null || base64 -D; } >> "$t"
+  recsize=3764
+fi
 absline=$((indexnum + data_offset + 1))
 tail -n +"$absline" "$s" | sed -n '/^-----END/q; p' | { base64 -d 2>/dev/null || base64 -D; } >> "$t"
+xeq_rebase_zip64 "$t" $((stubsize + recsize))
 xeq_msg 32 ████████ 1 "Assembled"
 
 chmod +x "$t"
