@@ -1,8 +1,9 @@
+use std::ffi::OsString;
 use std::path::Path;
 
 use crate::config::FLAG_DOWNGRADE_PERMITTED;
 
-pub fn check_updates(script: &Path, args: &[String], name: &str) {
+pub fn check_updates(script: &Path, args: &[OsString], name: &str) {
     // `script` is renamed below. `main` has already refused to run if it is not a regular
     // file; repeat the check here so the rename can never reach a directory or a stray
     // same-named neighbour, whatever a future caller does.
@@ -80,10 +81,13 @@ pub fn check_updates(script: &Path, args: &[String], name: &str) {
     crate::xeq::done(name, "Updated");
     crate::debug!("update: swap complete; re-execing");
 
+    // The arguments are re-execed as the bytes they arrived as, so a re-exec is invisible to
+    // the application even for an argument that is not UTF-8.
     #[cfg(unix)]
     unsafe {
         use std::ffi::CString;
-        let script_c = CString::new(script.as_os_str().to_string_lossy().as_bytes()).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        let script_c = CString::new(script.as_os_str().as_bytes()).unwrap();
         let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(args.len() + 2);
         argv.push(script_c.as_ptr());
         let arg_cstrs: Vec<CString> = args.iter()

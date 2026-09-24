@@ -1,10 +1,13 @@
+use std::ffi::OsString;
 use std::process::Command;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicI32, Ordering};
 
 // The wrapper mode: spawn java synchronously, forwarding TERM/INT/HUP to it.
-// The runner re-invokes itself in this mode so the daemon process appears in
-// `ps` under the client's name (since the launcher binary IS this runner with
-// the JAR appended), making `killall <client>` target only this daemon.
+// The runner re-invokes itself in this mode (marked by `XEQ_WRAP_JAVA` in the
+// environment) so the daemon process appears in `ps` under the client's name
+// (since the launcher binary IS this runner with the JAR appended), making
+// `killall <client>` target only this daemon.
 //
 // `args[0]` is the resolved java path; `args[1..]` are the java args.
 
@@ -12,12 +15,16 @@ use std::sync::atomic::{AtomicI32, Ordering};
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
 #[cfg(unix)]
-pub fn run(args: &[String]) -> ! {
+pub fn run(args: &[OsString]) -> ! {
     if args.is_empty() { std::process::exit(1); }
     let java = &args[0];
     let java_args = &args[1..];
 
-    let mut child = match Command::new(java).args(java_args).spawn() {
+    let mut child = match Command::new(java)
+        .args(java_args)
+        .env_remove(crate::WRAP_VARIABLE)
+        .spawn()
+    {
         Ok(child) => child,
         Err(_)    => std::process::exit(1),
     };
@@ -32,13 +39,12 @@ pub fn run(args: &[String]) -> ! {
     std::process::exit(code);
 }
 
+// The same inherited-disposition rule as the launcher's own handlers: a signal the
+// launcher was started with ignored stays ignored here too.
 #[cfg(unix)]
 fn install_handlers() {
-    let signals = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
-    unsafe {
-        for signal in signals {
-            libc::signal(signal, forward as *const () as libc::sighandler_t);
-        }
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        crate::signals::install_handler(signal, forward);
     }
 }
 
@@ -49,7 +55,7 @@ extern "C" fn forward(signal: libc::c_int) {
 }
 
 #[cfg(windows)]
-pub fn run(args: &[String]) -> ! {
+pub fn run(args: &[OsString]) -> ! {
     use std::os::windows::process::CommandExt;
     // The wrapper itself was launched with DETACHED_PROCESS and so has no
     // console; without CREATE_NO_WINDOW, Windows would allocate a fresh
@@ -71,6 +77,7 @@ pub fn run(args: &[String]) -> ! {
     let java_args = &args[1..];
     let mut child = match Command::new(java)
         .args(java_args)
+        .env_remove(crate::WRAP_VARIABLE)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
     {

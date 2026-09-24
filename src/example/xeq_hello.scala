@@ -31,14 +31,20 @@
                                                                                                   */
 package xeq
 
+import java.util.concurrent as juc
+
+import ambience.*
 import anticipation.*
 import contingency.*
+import distillate.*
 import ethereal.*
 import exoskeleton.*
 import gossamer.*
 import parasite.*
+import profanity.*
 import rudiments.*
 import turbulence.*
+import vacuous.*
 
 import backstops.stackTraceBackstop
 import executives.completionsExecutive
@@ -49,6 +55,11 @@ import threading.virtualThreading
 // `Packager`, running the result, and seeing `Hello world` exercises everything at once — a
 // real runner stub, a patched ETHRCFG block, an appended JAR, a daemon started over the
 // launcher protocol, and a reply carried back to the invoking terminal.
+//
+// The subcommands beyond the greeting exist for `etc/ci/e2e.sh`, which needs an application
+// at the other end of the socket that reads stdin to its end, exits with a chosen status,
+// echoes its arguments, and reports the signals it receives, so that the launcher's handling
+// of each can be observed from a shell.
 //
 // This is the one place in the repository where a daemon implementation appears, and it is
 // here as a *test peer*: the launcher's other end has to be something for an end-to-end test
@@ -63,6 +74,65 @@ import threading.virtualThreading
 // fixture only has to say hello.
 @main
 def hello(): Unit = cli:
-  execute:
-    Out.println(t"Hello world")
-    Exit.Ok
+  arguments match
+    case Nil =>
+      execute:
+        Out.println(t"Hello world")
+        Exit.Ok
+
+    // Each argument on its own line, exactly as received.
+    case Argument("args") :: rest =>
+      execute(Out.print(rest.map(_()).join(t"\n")) yet Exit.Ok)
+
+    // Standard input, copied to standard output once it has ended.
+    case Argument("cat") :: Nil =>
+      execute:
+        val bytes = summon[Stdio].in.readAllBytes().nn
+        Out.print(String(bytes, "UTF-8").tt)
+        Exit.Ok
+
+    case Argument("exit") :: Argument(As[Int](status)) :: Nil =>
+      execute(Exit.Fail(status))
+
+    case Argument("stderr") :: text :: Nil =>
+      execute(Err.println(text()) yet Exit.Ok)
+
+    // Sleeps, but accepts a TERM signal and ends early on it: the case in which the
+    // launcher, rather than the daemon, decides how the invocation's death is reported.
+    case Argument("sleep") :: Argument(As[Int](seconds)) :: Nil =>
+      execute:
+        val done: juc.CountDownLatch = juc.CountDownLatch(1)
+
+        trap:
+          case Interrupt.Term =>
+            done.countDown()
+            SignalResponse.Accept
+
+        done.await(seconds.toLong, juc.TimeUnit.SECONDS)
+        Exit.Ok
+
+    // Prints the name of the first signal forwarded to it, or `(timeout)` after two seconds.
+    case Argument("signal") :: Nil =>
+      execute:
+        val received: juc.LinkedBlockingQueue[Text] = juc.LinkedBlockingQueue()
+
+        trap:
+          case signal: UnixSignal =>
+            received.offer(signal.shortName)
+            SignalResponse.Accept
+
+          case signal: WindowsSignal =>
+            received.offer(signal.shortName)
+            SignalResponse.Accept
+
+        val raw: Text | Null = received.poll(2L, juc.TimeUnit.SECONDS)
+        Out.print(if raw == null then t"(timeout)" else raw)
+        Exit.Ok
+
+    case Argument("env") :: Argument(variable) :: Nil =>
+      execute:
+        Out.print(safely(Environment[Text](variable)).or(t""))
+        Exit.Ok
+
+    case _ =>
+      execute(Exit.Fail(1))
