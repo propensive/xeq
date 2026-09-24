@@ -367,6 +367,27 @@ object xeq extends Module:
     override def artifactName = Task("xeq-test")
     override def scalacOptions = settings.sep(super.scalacOptions())
 
+  // Everything the builder bakes into the script: the release version, base URL and stub
+  // hashes, the polyglot templates, and the three shell sections it splices together.
+  def scriptSources = Task.Sources
+   ( mill.api.BuildCtx.workspaceRoot / "res" / "packager" / "xeq",
+     mill.api.BuildCtx.workspaceRoot / "res" / "core" / "xeq",
+     mill.api.BuildCtx.workspaceRoot / "src" / "script",
+     mill.api.BuildCtx.workspaceRoot / "etc" / "ci" / "xeq-script-build.sh" )
+
+  // `dist/xeq`, the builder script the suite drives, produced by `make xeq-script` — which
+  // stays the one place that knows how it is assembled.
+  //
+  // It exists as a Mill target only so that CI can ask for it: the shared workflow never runs
+  // the Makefile, it runs the targets named in `compile` and then `fume run` over the test
+  // assembly, and `fume` resolves the script from the working directory. Without this the
+  // suite found no script, skipped every test and reported success. Named in the `compile`
+  // list in .github/workflows/build.yml, which runs before the test step.
+  def script: T[Unit] = Task:
+    scriptSources()
+    os.proc("make", "xeq-script")
+     .call(cwd = mill.api.BuildCtx.workspaceRoot, stdout = os.Inherit, stderr = os.Inherit)
+
   // The end-to-end fixture: a real daemonized application, packaged by the modules above and run
   // through a real runner stub. This is the ONE module that depends on a daemon implementation
   // (Soundness's `ethereal`), because the other end of the protocol has to be *something* for an
