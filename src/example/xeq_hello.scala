@@ -54,17 +54,15 @@ import threading.virtualThreading
 // here as a *test peer*: the launcher's other end has to be something for an end-to-end test
 // to exist. Nothing published from this repository depends on it — see the `example` module in
 // `build.mill`, which is outside every aggregate.
+//
+// It uses only the API of the Soundness *release* pinned in `etc/refs`, never of an unreleased
+// daemon: Soundness pins this repository's release in its `etc/xeq.tsv`, so a fixture here
+// that needed the daemon's next release would make the two unable to release at all. What a
+// new protocol field actually does (say, the per-stream terminal flags of `xeq-0.7`) is
+// asserted in Soundness's `ethereal` suite, which runs against a locally built stub; this
+// fixture only has to say hello.
 @main
 def hello(): Unit = cli:
   execute:
     Out.println(t"Hello world")
-
-    // On stderr, so the `Hello world` the end-to-end script captures on stdout stays the
-    // only thing there. Reporting all three lets a redirection be checked from the outside:
-    // whichever stream is redirected, one of the others still carries the report.
-    val in = service.cliInput.toString.tt
-    val out = service.cliOutput.toString.tt
-    val err = service.cliError.toString.tt
-    Err.println(t"streams: stdin=$in stdout=$out stderr=$err")
-
     Exit.Ok

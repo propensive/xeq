@@ -37,6 +37,16 @@ version it declares for its next release. The build reads the file through the `
    propensive/.github whose scripts (`sync-deps.sh`, `snapshot.sh`, `deps.py`,
    `release-launcher.sh`, …) run here, and a bump is a deliberate one-line change. Set
    `PROPENSIVE_GITHUB=/path/to/a/.github/checkout` to test a change to the scripts themselves.
+6. **Never pin a Soundness snapshot here, even briefly.** Soundness pins *this* repository's
+   release in its `etc/xeq.tsv`, so a snapshot pin in `etc/refs` closes a cycle: neither side
+   could be released before the other. The pin is always a Soundness release, and everything
+   Scala here — `src/example`, the end-to-end fixture, included — uses only that release's API.
+   When a protocol change needs new daemon behaviour, do not teach the fixture about it: the
+   assertion belongs in Soundness's `ethereal` suite, run with `XEQ` pointing at a script built
+   from this checkout (`make runners-build`, then `etc/ci/xeq-script-build.sh`). The order is
+   then fixed: this repository merges and releases first, Soundness bumps `etc/xeq.tsv` to the
+   new release, and only afterwards may `etc/refs` here move up to the Soundness release that
+   followed.
 
 ### Tools are not dependencies
 

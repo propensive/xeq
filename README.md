@@ -62,7 +62,9 @@ what makes it safe for them to release on their own cadences.
 
 XEQ's Scala modules are *built* against Soundness's libraries, as any Scala project might be.
 Nothing here depends on `ethereal`, the daemon, except the end-to-end fixture, which needs
-something at the other end of the socket to be a test at all.
+something at the other end of the socket to be a test at all. That pin (`etc/refs`) is always
+a Soundness *release*, never a snapshot, because Soundness in turn pins an XEQ release in its
+`etc/xeq.tsv`: a protocol change is released here first, and Soundness follows.
 
 ## Building
 
