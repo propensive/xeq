@@ -6,6 +6,7 @@ first message rather than misreading fields.
 
 | Release | Protocol | Schema signature (BLAKE3-256 + cadence) | `ETHRCFG` | Reference daemon |
 |---|---|---|---|---|
+| next | `ethereal-launcher` BinTEL | `e50b7e82c11b06783dafa8a2ecc4e35f7ba31044ecd38fc5d9fe9e47a7c11e59e5` | v3 | Soundness: unreleased; see below |
 | `xeq-0.7` | `ethereal-launcher` BinTEL | `eeced165c15f73119cf7710812671924aa558722927d29f37538e7b3953296c2ce` | v3 | Soundness ≥ 0.69.0 (`ethereal-core`) |
 | `xeq-0.6` | `ethereal-launcher` BinTEL | `4701ec19cd0fd3ecfc0e1b8a6525b4edc3a3b1deda370f681986db9aa39c1da692` | v3 | Soundness ≥ 0.65.0 (`ethereal-core`) |
 | `runners-0.5` | `ethereal-launcher` BinTEL | `4701ec19cd0fd3ecfc0e1b8a6525b4edc3a3b1deda370f681986db9aa39c1da692` | v2 | Soundness ≥ 0.65.0 (`ethereal-core`) |
@@ -33,6 +34,14 @@ a signature no side actually sends.
 `stdin-tty`, `stdout-tty` and `stderr-tty`, and `argument` and `environment` moved to indices
 8 and 9. A command can now tell whether *its own output* is a terminal, which is what a tool
 emitting binary data needs in order to refuse to run without a redirection.
+
+The next release revises the protocol again: `record Init` gains `invoked-as`, `umask`,
+`columns`, `rows`, `input-codepage` and `output-codepage` (indices 10–15, after the existing
+fields, which keep theirs); `record Signal` gains `columns`, `rows` and `deadline`; and two
+variants are added at the end of `select Message`, `closed` (an output stream has lost its
+reader) and `shutdown` (a request that the daemon exit). `uid` becomes the platform's
+identifier — a SID on Windows — rather than a number. What each means is in
+[`launcher.md`](launcher.md) and [`layout.md`](layout.md).
 
 ## Protocol versions
 

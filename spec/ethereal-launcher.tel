@@ -14,6 +14,8 @@ select Message
   variant verdict Verdict
   variant mode Mode
   variant exit-status ExitStatus
+  variant closed Closed
+  variant shutdown Shutdown
 
 record Init
   description
@@ -21,7 +23,13 @@ record Init
       stdin to the daemon and the daemon's stdout to the client.
       The three tty flags say which of the client's streams are
       attached to a terminal; the daemon sees only sockets and
-      cannot determine this for itself.
+      cannot determine this for itself. The uid is the platform's
+      identifier for the user: numeric on Unix, a SID on Windows.
+      The invoked-as field is argv[0] as the caller supplied it,
+      for a multi-call binary to dispatch on; script is the
+      canonical path. The umask is octal; columns and rows are the
+      terminal's size when stdout is a terminal; the code pages are
+      the Windows console's input and output code pages.
   field pid String required
   field uid String required
   field username String required
@@ -32,6 +40,12 @@ record Init
   field stderr-tty Flag optional
   field argument String optional repeatable
   field environment String optional repeatable
+  field invoked-as String optional
+  field umask String optional
+  field columns String optional
+  field rows String optional
+  field input-codepage String optional
+  field output-codepage String optional
 
 record Stderr
   description
@@ -45,9 +59,16 @@ record Control
 
 record Signal
   description
-      A signal the client received, named without its SIG prefix.
+      A signal the client received, named without its SIG prefix,
+      or a Windows console control event. WINCH and CONT carry the
+      terminal's current size; a Windows close, logoff or shutdown
+      carries the milliseconds the system allows before it ends
+      the client regardless.
   field pid String required
   field name String required
+  field columns String optional
+  field rows String optional
+  field deadline String optional
 
 record Exit
   description
@@ -77,3 +98,21 @@ record Mode
 
 record ExitStatus
   field code String required
+
+record Closed
+  description
+      The named output stream of the invocation, stdout or stderr,
+      has lost its reader: the client could not write to it. Sent
+      once, on its own connection, and not answered. The daemon
+      should fail the invocation's further writes to that stream,
+      as a broken pipe would.
+  field pid String required
+  field stream String required
+
+record Shutdown
+  description
+      Asks the daemon to exit: to accept no further invocations, to
+      let those in flight finish, and then to end. Not answered; the
+      connection is closed. A launcher whose daemon is gone starts a
+      fresh one, so this reclaims a warm JVM without leaving anything
+      broken.

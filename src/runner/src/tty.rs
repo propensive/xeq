@@ -45,6 +45,32 @@ impl TtyState {
     }
 }
 
+// The process's file-creation mask, in octal. `umask` can only be read by setting it, so
+// this must run before any thread that might create a file — it is called once, at startup.
+#[cfg(unix)]
+pub fn umask() -> Option<String> {
+    unsafe {
+        let current = libc::umask(0);
+        libc::umask(current);
+        Some(format!("{:03o}", current))
+    }
+}
+
+#[cfg(windows)]
+pub fn umask() -> Option<String> { None }
+
+// The console's input and output code pages: how the daemon should interpret the bytes it
+// reads and encode the bytes it writes, on a console that is not UTF-8.
+#[cfg(windows)]
+pub fn codepages() -> Option<(u32, u32)> {
+    use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP};
+    let (input, output) = unsafe { (GetConsoleCP(), GetConsoleOutputCP()) };
+    if input == 0 && output == 0 { None } else { Some((input, output)) }
+}
+
+#[cfg(unix)]
+pub fn codepages() -> Option<(u32, u32)> { None }
+
 // Whether this process may read and reconfigure the terminal on stdin: under job control,
 // only the foreground process group of the controlling terminal may, and a background job
 // that tried would be stopped by SIGTTIN or SIGTTOU. True when stdin is not a terminal —
@@ -68,14 +94,18 @@ pub fn in_foreground() -> bool { true }
 // the socket pipeline.
 #[cfg(unix)]
 pub fn terminal_size() -> Option<(u16, u16)> {
-    if !stdin_is_tty() { return None; }
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
-    if result == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-        Some((ws.ws_col, ws.ws_row))
-    } else {
-        None
+    // Whichever standard stream is the terminal answers; stdout first, since the size
+    // matters to what is written there. A pseudo-terminal whose size was never set reports
+    // zero, which is no answer.
+    for fd in [libc::STDOUT_FILENO, libc::STDIN_FILENO, libc::STDERR_FILENO] {
+        if unsafe { libc::isatty(fd) } == 0 { continue; }
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+        if result == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+            return Some((ws.ws_col, ws.ws_row));
+        }
     }
+    None
 }
 
 // OSC 11 query (`\e]11;?\e\\`) asks the terminal to report its background
@@ -128,13 +158,64 @@ pub fn query_bg_color(timeout: std::time::Duration) -> (Option<String>, Vec<u8>)
     parse_osc11(&buf)
 }
 
+// The classic Windows console does not answer an OSC 11 query, and a query it does not
+// understand would sit in the input as garbage; Windows Terminal answers it. So ask only
+// under Windows Terminal (which marks its sessions with `WT_SESSION`), and read the reply
+// through the console input queue rather than a blocking read: the queue may hold focus or
+// mouse records that a character read would wait behind.
 #[cfg(windows)]
-pub fn query_bg_color(_timeout: std::time::Duration) -> (Option<String>, Vec<u8>) {
-    // Windows Console doesn't reliably support OSC 11 background queries.
-    (None, Vec::new())
+pub fn query_bg_color(timeout: std::time::Duration) -> (Option<String>, Vec<u8>) {
+    use std::io::{Read, Write};
+    use std::time::Instant;
+    use windows_sys::Win32::System::Console::{
+        GetNumberOfConsoleInputEvents, GetStdHandle, PeekConsoleInputW, ReadConsoleInputW,
+        INPUT_RECORD, KEY_EVENT, STD_INPUT_HANDLE,
+    };
+
+    if !stdin_is_tty() || std::env::var_os("WT_SESSION").is_none() { return (None, Vec::new()); }
+
+    let mut stdout = std::io::stdout();
+    if stdout.write_all(b"\x1b]11;?\x1b\\").is_err() { return (None, Vec::new()); }
+    let _ = stdout.flush();
+
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    let deadline = Instant::now() + timeout;
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+
+    while Instant::now() < deadline {
+        let mut pending: u32 = 0;
+        if unsafe { GetNumberOfConsoleInputEvents(handle, &mut pending) } == 0 { break; }
+        if pending == 0 { std::thread::sleep(std::time::Duration::from_millis(5)); continue; }
+
+        let mut records: [INPUT_RECORD; 32] = unsafe { std::mem::zeroed() };
+        let mut count: u32 = 0;
+        if unsafe { PeekConsoleInputW(handle, records.as_mut_ptr(), 32, &mut count) } == 0 { break; }
+        let characters = records[..count as usize].iter().any(|record| unsafe {
+            record.EventType as u32 == KEY_EVENT
+                && record.Event.KeyEvent.bKeyDown != 0
+                && record.Event.KeyEvent.uChar.UnicodeChar != 0
+        });
+
+        if characters {
+            // A character read returns what is pending without waiting for more.
+            let mut chunk = [0u8; 64];
+            match std::io::stdin().read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if find_subseq(&buf, b"\x1b\\").is_some() || buf.contains(&0x07) { break; }
+                }
+            }
+        } else {
+            // Only non-character records: discard them so they cannot block a later read.
+            let mut discarded: u32 = 0;
+            unsafe { ReadConsoleInputW(handle, records.as_mut_ptr(), count, &mut discarded); }
+        }
+    }
+
+    parse_osc11(&buf)
 }
 
-#[cfg(unix)]
 fn parse_osc11(buf: &[u8]) -> (Option<String>, Vec<u8>) {
     let prefix = b"\x1b]11;rgb:";
     let Some(start) = find_subseq(buf, prefix) else {
@@ -161,7 +242,6 @@ fn parse_osc11(buf: &[u8]) -> (Option<String>, Vec<u8>) {
     (rgb_str, leftover)
 }
 
-#[cfg(unix)]
 fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() { return None; }
     haystack.windows(needle.len()).position(|w| w == needle)
@@ -429,3 +509,4 @@ pub fn restore_tty_state(state: &TtyState) {
         }
     }
 }
+

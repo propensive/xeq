@@ -24,6 +24,65 @@ pub fn base_dir(name: &str) -> PathBuf {
     base.join(name)
 }
 
+// Creates the state directory, private to the invoking user, or verifies that an existing one
+// is: the socket inside it is the boundary between users, since the daemon believes what a
+// connecting client says about itself. On Unix the directory is created mode 0700 explicitly
+// rather than under the umask, and an existing directory must be owned by this user and
+// closed to everyone else — a permissive mode is tightened when the directory is ours, and a
+// directory that is not ours is refused. On Windows the directory lies under the user's own
+// profile, whose ACL grants no one else access, and nothing further is checked.
+pub fn prepare_base_dir(base_dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        if !base_dir.is_dir() {
+            if let Some(parent) = base_dir.parent() { let _ = fs::create_dir_all(parent); }
+            fs::DirBuilder::new().mode(0o700).create(base_dir)
+                .map_err(|error| format!("it could not be created ({error})"))?;
+        }
+        let metadata = fs::metadata(base_dir)
+            .map_err(|error| format!("it could not be examined ({error})"))?;
+        let me = unsafe { libc::geteuid() };
+        if metadata.uid() != me {
+            return Err(format!("it is owned by user {}, not by this user ({me})", metadata.uid()));
+        }
+        if metadata.mode() & 0o077 != 0 {
+            fs::set_permissions(base_dir, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("its permissions could not be restricted ({error})"))?;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        fs::create_dir_all(base_dir).map_err(|error| format!("it could not be created ({error})"))
+    }
+}
+
+// Whether the daemon's socket may be trusted: created by this user, and reachable by no other,
+// so that whoever is listening is a daemon this user started. Anything else is refused rather
+// than connected to. Always true on Windows, where the directory's ACL is the boundary.
+pub fn socket_private(socket_file: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(socket_file)
+            .map_err(|error| format!("it could not be examined ({error})"))?;
+        let me = unsafe { libc::geteuid() };
+        if metadata.uid() != me {
+            return Err(format!("it is owned by user {}, not by this user ({me})", metadata.uid()));
+        }
+        if metadata.mode() & 0o077 != 0 {
+            return Err(format!("its mode is {:04o}, which admits other users", metadata.mode() & 0o7777));
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let _ = socket_file;
+        Ok(())
+    }
+}
+
 pub fn data_home() -> PathBuf {
     #[cfg(windows)]
     { local_app_data() }

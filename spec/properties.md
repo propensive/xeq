@@ -10,7 +10,7 @@ who launched it, and the daemon may rely on every one of them being present.
 |---|---|
 | `build.id` | The `build_id` from the executable's `ETHRCFG` record (see [`ethrcfg.md`](ethrcfg.md)) |
 | `ethereal.name` | The command name — the basename the executable was invoked as. Its presence is what tells the JVM it was started by a launcher rather than run directly |
-| `ethereal.user.id` | The invoking user's numeric id (`0` where the platform has none) |
+| `ethereal.user.id` | The *effective* user the daemon runs as: the numeric id on Unix (`geteuid`), the SID (`S-1-5-…`) on Windows, or empty if it cannot be determined. Each invocation's own user arrives in its `init` document |
 | `ethereal.user.name` | The invoking user's name |
 | `ethereal.script` | The absolute path of the executable that launched this daemon |
 | `ethereal.startTime` | Milliseconds since the epoch at launch, used to report startup latency |
