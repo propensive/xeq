@@ -21,6 +21,7 @@ Within it:
 | `socket` | daemon | The Unix-domain socket the daemon listens on (an `AF_UNIX` socket on Windows too) |
 | `pid` | daemon | The daemon's process id |
 | `build` | daemon | The launcher content the daemon was started from, which the launcher reads to detect a stale daemon after a rebuild; see *Staleness* |
+| `acceptance` | daemon | Which compositions of the protocol schema the daemon reads: a BinTEL §8.4 acceptance, which the launcher consults before its first connection; see *Negotiating the composition* |
 | `fail` | daemon | Written when startup fails, so the launcher can report the reason instead of timing out |
 | `progress` | daemon | Dependency-download progress, tailed and rendered by the launcher (see `burdock.progress`) |
 | `lock` | launcher | Held while starting a daemon, so concurrent invocations start exactly one |
@@ -88,6 +89,61 @@ daemon, over the protocol, whether it is still fresh (`verify` → `verdict`). T
 at most once per change and remembers the answer, which a stateless launcher cannot do. A
 stale daemon shuts down and the launcher waits for its death before starting a new one.
 
+## Negotiating the composition
+
+The protocol schema (`ethereal-launcher.tel`) is a *base* which may, over time, gain
+*layers* — TEL §20.3 extensions that append optional members to its records. A launcher and
+a daemon need not hold the same layers: each invocation is written under a *composition*, the
+base with some prefix of the layers, that both sides hold, and the acceptance is how the
+launcher finds out which. `COMPATIBILITY.md` says what a layer may contain and why the base
+signature is unaffected.
+
+**The daemon publishes what it reads.** Before it binds `socket`, the daemon writes
+`acceptance`: an acceptance as defined in §8.4 of the BinTEL Specification, in the **bare
+form** — the document root alone, with no framing, under the `acceptance` schema pinned there
+(`specification.tel/acceptance:1.0.0`). It names, in preference order, the compositions the
+daemon will read under and the further layers it holds. The reference daemon writes one
+alternative: the **base alone** as its requirement (the shortest composition it needs, per
+§8.3's receiver guidance) and a `component` prefix — four bytes, or more if four are
+ambiguous within the lineage — for **every layer it holds**. A daemon holding the base and no
+layer therefore writes these 38 bytes:
+
+    01 00 01 00 21 ‖ the 33-byte base signature
+
+(one root child; the `accept` member with one child; its `schema` member, 33 bytes long). The
+file is written whole, before the socket exists, so a launcher that has found the socket may
+rely on it, and is removed with the daemon's other files.
+
+**The launcher chooses.** Before its first connection the launcher reads the file and serves
+the first alternative it can, as §8.4's writer obligations require, specialised to a library
+that is a single chain — the base, then the base with the first layer, and so on, in the
+order `ethereal-launcher.tel` declares them:
+
+1. An alternative is servable when its `schema` is, byte for byte, the signature of some
+   prefix of that chain. The launcher computes those signatures itself (BinTEL §8.2 is a
+   few XORs over the pinned component hashes), so it needs no palimpsest search and holds
+   no TEL machinery.
+2. The composition is then extended by each further layer of the chain, in order, for as
+   long as the alternative names it: by a `component` value that is a prefix of that layer's
+   hash and of no other component the launcher holds, or wholesale by `any-published`, every
+   layer of the specification being a published component. A prefix that matches nothing
+   the launcher holds — a layer newer than it — denotes nothing, and so does one that matches
+   two.
+3. Every document of the invocation, on every connection it opens, is written under that
+   composition and carries its signature.
+
+**The daemon answers in kind.** Every document the daemon writes on a connection is written
+under the composition of the connection's opening document. In the terms of §8.4, the opening
+document's signature *is* the launcher's acceptance: one alternative, no components, no
+flags — "send me exactly this". Layers are per schema, not per direction, so the composition a
+launcher can write is precisely the one it can read.
+
+**When there is nothing to read.** A daemon that predates acceptances writes no file, and a
+file the launcher cannot parse is treated as absent: the launcher writes the base alone, which
+is what such a daemon reads. When no alternative is servable — every one names another base,
+or requires a layer this launcher lacks — the launcher reports, before it connects, that the
+daemon speaks another protocol, naming both bases, and exits with status 2.
+
 ## Lifecycle
 
 The daemon's lifetime is part of the contract, because a launcher has to know what to expect
@@ -99,7 +155,8 @@ there: a missing or unresponsive socket means *start one*, never *fail*. Nothing
 idle exit but the warm JVM, which the next invocation pays for again.
 
 **Shutdown.** The `shutdown` document asks a daemon to exit cleanly: it must accept no further
-invocations, let those in flight finish, and then end, removing its state files. It is not
+invocations, let those in flight finish, and then end, removing its state files (`acceptance`
+among them). It is not
 answered; the connection is simply closed. This is how tooling stops a daemon without finding
 its pid, and how a user reclaims a warm JVM held for a command run rarely. The launcher itself
 never sends it.

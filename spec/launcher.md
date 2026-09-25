@@ -82,6 +82,36 @@ inherits that process's context, not the client's, for everything not listed abo
 An author of a security- or resource-sensitive tool should not rely on any of these
 following the client.
 
+## The composition an invocation is written under
+
+Every document the launcher writes carries the signature of the schema composition it was
+written under (BinTEL §6.1, §8.2): the base `ethereal-launcher` schema, or the base with the
+first *n* of its layers. The launcher settles on one composition per invocation, before its
+first connection, and uses it on every connection the invocation opens — `init`, `stderr`,
+`control`, each `signal`, `closed` and `exit` — and expects every reply under it.
+
+It chooses by reading the daemon's `acceptance` file from the state directory, and the rule is
+in `layout.md` under *Negotiating the composition*: the first alternative whose requirement is
+a prefix of the launcher's own chain of layers, extended by every further layer the daemon
+names, in order. In short, the richest composition both sides hold. Under
+`ETHEREAL_DEBUG` the depth and signature chosen are traced.
+
+The launcher compiles in, for each layer it knows, the layer's hash and the members it appends
+to each record, so a layer's fields take the keyword indices after the base's (and after any
+earlier layer's) and the base's indices never move. Nothing is parsed at run time but the
+acceptance itself, whose form is fixed.
+
+Three outcomes:
+
+- **No file, or one the launcher cannot parse**: the base alone. That is what a daemon which
+  predates acceptances reads, and the wire bytes are then exactly those of a launcher without
+  this mechanism.
+- **A servable alternative**: the invocation proceeds under the chosen composition.
+- **No servable alternative**: the daemon speaks another base, or requires a layer this
+  launcher lacks. The launcher prints, to stderr, that the daemon speaks another launcher
+  protocol, giving both base hashes, and exits with status 2 without connecting — a daemon
+  would only close the connection, which is less to go on.
+
 ## The terminal
 
 When stdin is a terminal and the launcher is in the terminal's **foreground process group**,

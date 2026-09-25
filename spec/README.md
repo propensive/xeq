@@ -41,9 +41,26 @@ project; "ethereal" names the protocol an XEQ executable speaks.
 
 ## Changing a contract
 
-Both sides carry the schema signature (§ `ethereal-launcher.tel`) and refuse a peer that
+Both sides carry the schema's signature (§ `ethereal-launcher.tel`) and refuse a peer that
 disagrees, so a mismatched pair fails loudly at the first document instead of misreading
-fields. That makes the rollout order safe but strict:
+fields. There are two kinds of change, and which kind a change is decides how it ships.
+
+### A compatible change: a layer
+
+An addition that an old peer could safely ignore — a new optional field on an existing message,
+a new record — goes in a **layer** of `ethereal-launcher.tel` (TEL §20.3). A layer has its own
+hash and leaves the base's signature untouched; each invocation is written under the richest
+composition of base and layers that both sides hold, which the launcher learns from the
+acceptance the daemon publishes (BinTEL §8.3–8.4; [`layout.md`](layout.md), *Negotiating the
+composition*), and the daemon answers under the same. A launcher and a daemon that hold
+different layers therefore still talk, using what they share, and the runner and the daemon
+may adopt a layer **in either order**, each on its own cadence. What a layer may contain, and
+why, is in [`COMPATIBILITY.md`](COMPATIBILITY.md).
+
+### A breaking change: a base revision
+
+A new message kind, a required field, or a change to what an existing field means alters the
+base, and so its signature. The rollout order is then strict:
 
 1. **This repository first.** Change the contract here, change the runner, and publish a new
    `xeq-<version>` release. Nothing depends on the daemon, so this can ship alone.

@@ -2,10 +2,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
+use crate::bintel::Composition;
 use crate::protocol::{SignalAck, SignalDetail};
 use crate::tty::TtyState;
 
 static SOCKET_PATH: OnceLock<PathBuf> = OnceLock::new();
+// The composition the invocation's documents are written under; see `acceptance.rs`.
+static COMPOSITION: OnceLock<Composition> = OnceLock::new();
 static CLIENT_PID: AtomicU32 = AtomicU32::new(0);
 static TERMINATION: OnceLock<Arc<AtomicI32>> = OnceLock::new();
 static SAVED_TTY: OnceLock<TtyState> = OnceLock::new();
@@ -18,7 +21,7 @@ static TIMEOUT_MS: AtomicU32 = AtomicU32::new(250);
 const DEFAULT_TIMEOUT_MS: u32 = 250;
 
 fn forward_signal(name: &str, detail: SignalDetail) -> SignalAck {
-    if let Some(path) = SOCKET_PATH.get() {
+    if let (Some(path), Some(composition)) = (SOCKET_PATH.get(), COMPOSITION.get()) {
         // UnixStream::connect is not strictly async-signal-safe (allocates),
         // but this matches the pre-existing TcpStream::connect behaviour and
         // has been reliable in practice. Revisit only if signal storms cause
@@ -29,6 +32,7 @@ fn forward_signal(name: &str, detail: SignalDetail) -> SignalAck {
             name,
             detail,
             TIMEOUT_MS.load(Ordering::SeqCst) as u64,
+            composition,
         )
     } else {
         SignalAck::Timeout
@@ -55,12 +59,14 @@ fn flag_termination(code: i32) {
 
 fn install_state(
     socket_path: PathBuf,
+    composition: Composition,
     pid: u32,
     termination: Arc<AtomicI32>,
     saved_tty: TtyState,
     raw_mode_owned: bool,
 ) {
     let _ = SOCKET_PATH.set(socket_path);
+    let _ = COMPOSITION.set(composition);
     CLIENT_PID.store(pid, Ordering::SeqCst);
     let _ = TERMINATION.set(termination);
     let _ = SAVED_TTY.set(saved_tty);
@@ -139,12 +145,13 @@ pub(crate) fn install_handler(signal: libc::c_int, handler: extern "C" fn(libc::
 #[cfg(unix)]
 pub fn install(
     socket_path: PathBuf,
+    composition: Composition,
     pid: u32,
     termination: Arc<AtomicI32>,
     saved_tty: TtyState,
     raw_mode_owned: bool,
 ) {
-    install_state(socket_path, pid, termination, saved_tty, raw_mode_owned);
+    install_state(socket_path, composition, pid, termination, saved_tty, raw_mode_owned);
 
     let signals = [
         libc::SIGINT, libc::SIGQUIT, libc::SIGWINCH, libc::SIGTERM,
@@ -235,13 +242,14 @@ fn fallback(name: &str) {
 #[cfg(windows)]
 pub fn install(
     socket_path: PathBuf,
+    composition: Composition,
     pid: u32,
     termination: Arc<AtomicI32>,
     saved_tty: TtyState,
     raw_mode_owned: bool,
 ) {
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-    install_state(socket_path, pid, termination, saved_tty, raw_mode_owned);
+    install_state(socket_path, composition, pid, termination, saved_tty, raw_mode_owned);
     unsafe { SetConsoleCtrlHandler(Some(console_handler), 1); }
 }
 
