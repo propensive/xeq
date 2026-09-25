@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::bintel::{self, variant, Record, Reply};
+use crate::bintel::{self, variant, Composition, Record, Reply};
 use crate::uds::UnixStream;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,12 +38,14 @@ pub struct ClientInfo {
 }
 
 // Every connection to the daemon opens with one BinTEL document of the `ethereal-launcher`
-// schema (see `bintel.rs`); what follows depends on the message. After `init` the connection
+// schema (see `bintel.rs`), written under the composition chosen for the invocation from the
+// daemon's acceptance (`acceptance.rs`); the daemon answers under the same composition. What
+// follows depends on the message. After `init` the connection
 // is the invocation's stdin and stdout; after `stderr` it delivers stderr; after `control` the
 // daemon sends `mode` documents on it; `signal`, `verify` and `exit` are answered with one
 // document each and closed; `closed` is not answered.
 
-pub fn init_document(info: &ClientInfo) -> Vec<u8> {
+pub fn init_document(info: &ClientInfo, composition: &Composition) -> Vec<u8> {
     let mut record = Record::new();
     record.scalar(0, &info.pid.to_string());
     record.scalar(1, &info.user_id);
@@ -65,11 +67,11 @@ pub fn init_document(info: &ClientInfo) -> Vec<u8> {
         record.scalar(14, &input.to_string());
         record.scalar(15, &output.to_string());
     }
-    bintel::document(variant::INIT, record)
+    bintel::document(variant::INIT, record, composition)
 }
 
-pub fn send_init(connection: &mut UnixStream, info: &ClientInfo) {
-    let _ = connection.write_all(&init_document(info));
+pub fn send_init(connection: &mut UnixStream, info: &ClientInfo, composition: &Composition) {
+    let _ = connection.write_all(&init_document(info, composition));
     let _ = connection.flush();
 }
 
@@ -79,8 +81,8 @@ fn pid_record(pid: u32) -> Record {
     record
 }
 
-pub fn send_stderr_request(connection: &mut UnixStream, pid: u32) {
-    let _ = connection.write_all(&bintel::document(variant::STDERR, pid_record(pid)));
+pub fn send_stderr_request(connection: &mut UnixStream, pid: u32, composition: &Composition) {
+    let _ = connection.write_all(&bintel::document(variant::STDERR, pid_record(pid), composition));
     let _ = connection.flush();
 }
 
@@ -97,15 +99,15 @@ pub enum Verdict {
 // document says fresh or stale (the daemon then shuts down; await its death and launch
 // afresh); anything else — including a daemon too old to speak this protocol, which just
 // closes the connection — means proceed as normal.
-pub fn verify(socket_path: &Path) -> Verdict {
+pub fn verify(socket_path: &Path, composition: &Composition) -> Verdict {
     let mut connection = match UnixStream::connect(socket_path) {
         Ok(connection) => connection,
         Err(_) => return Verdict::Fresh,
     };
     let _ = connection.set_read_timeout(Some(REPLY_TIMEOUT));
-    let _ = connection.write_all(&bintel::document(variant::VERIFY, Record::new()));
+    let _ = connection.write_all(&bintel::document(variant::VERIFY, Record::new(), composition));
     let _ = connection.flush();
-    match bintel::read_document(&mut connection).ok().and_then(|doc| bintel::parse_reply(&doc)) {
+    match bintel::read_document(&mut connection).ok().and_then(|doc| bintel::parse_reply(&doc, composition)) {
         Some(Reply::Verdict { fresh: false }) => Verdict::Stale,
         _ => Verdict::Fresh,
     }
@@ -116,8 +118,8 @@ pub fn verify(socket_path: &Path) -> Verdict {
 // launcher is the only process that can change the client's tty mode, and it has already
 // raw-moded the terminal by the time the daemon knows which command is running, so the
 // request has to be pushed back here.
-pub fn send_control_request(connection: &mut UnixStream, pid: u32) {
-    let _ = connection.write_all(&bintel::document(variant::CONTROL, pid_record(pid)));
+pub fn send_control_request(connection: &mut UnixStream, pid: u32, composition: &Composition) {
+    let _ = connection.write_all(&bintel::document(variant::CONTROL, pid_record(pid), composition));
     let _ = connection.flush();
 }
 
@@ -130,7 +132,7 @@ pub struct SignalDetail {
     pub deadline_ms: Option<u64>,
 }
 
-pub fn signal_document(pid: u32, name: &str, detail: SignalDetail) -> Vec<u8> {
+pub fn signal_document(pid: u32, name: &str, detail: SignalDetail, composition: &Composition) -> Vec<u8> {
     let mut record = pid_record(pid);
     record.scalar(1, name);
     if let Some((columns, rows)) = detail.size {
@@ -138,7 +140,7 @@ pub fn signal_document(pid: u32, name: &str, detail: SignalDetail) -> Vec<u8> {
         record.scalar(3, &rows.to_string());
     }
     if let Some(deadline) = detail.deadline_ms { record.scalar(4, &deadline.to_string()); }
-    bintel::document(variant::SIGNAL, record)
+    bintel::document(variant::SIGNAL, record, composition)
 }
 
 pub fn send_signal(
@@ -147,36 +149,37 @@ pub fn send_signal(
     name: &str,
     detail: SignalDetail,
     timeout_ms: u64,
+    composition: &Composition,
 ) -> SignalAck {
     let mut connection = match UnixStream::connect(socket_path) {
         Ok(connection) => connection,
         Err(_) => return SignalAck::Timeout,
     };
-    if connection.write_all(&signal_document(pid, name, detail)).is_err() {
+    if connection.write_all(&signal_document(pid, name, detail, composition)).is_err() {
         return SignalAck::Timeout;
     }
     if connection.flush().is_err() { return SignalAck::Timeout; }
     let _ = connection.set_read_timeout(Some(Duration::from_millis(timeout_ms)));
-    match bintel::read_document(&mut connection).ok().and_then(|doc| bintel::parse_reply(&doc)) {
+    match bintel::read_document(&mut connection).ok().and_then(|doc| bintel::parse_reply(&doc, composition)) {
         Some(Reply::SignalAck { accept: true })  => SignalAck::Accept,
         Some(Reply::SignalAck { accept: false }) => SignalAck::Reject,
         _                                        => SignalAck::Timeout,
     }
 }
 
-pub fn closed_document(pid: u32, stream: &str) -> Vec<u8> {
+pub fn closed_document(pid: u32, stream: &str, composition: &Composition) -> Vec<u8> {
     let mut record = pid_record(pid);
     record.scalar(1, stream);
-    bintel::document(variant::CLOSED, record)
+    bintel::document(variant::CLOSED, record, composition)
 }
 
 // Tells the daemon that the invocation's `stream` (`stdout` or `stderr`) has lost its
 // reader, so that it can fail the invocation's further writes as a broken pipe would. Not
 // answered: the launcher has nothing to wait for, and goes on draining the stream so the
 // daemon is never blocked writing it.
-pub fn send_closed(socket_path: &Path, pid: u32, stream: &str) {
+pub fn send_closed(socket_path: &Path, pid: u32, stream: &str, composition: &Composition) {
     if let Ok(mut connection) = UnixStream::connect(socket_path) {
-        let _ = connection.write_all(&closed_document(pid, stream));
+        let _ = connection.write_all(&closed_document(pid, stream, composition));
         let _ = connection.flush();
     }
 }
@@ -186,16 +189,16 @@ pub fn send_closed(socket_path: &Path, pid: u32, stream: &str) {
 // running time is unbounded by design; only the daemon's replies are bounded.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub fn terminate(socket_path: &Path, pid: u32) -> i32 {
+pub fn terminate(socket_path: &Path, pid: u32, composition: &Composition) -> i32 {
     let mut connection = match UnixStream::connect(socket_path) {
         Ok(connection) => connection,
         Err(_) => return 2,
     };
-    let _ = connection.write_all(&bintel::document(variant::EXIT, pid_record(pid)));
+    let _ = connection.write_all(&bintel::document(variant::EXIT, pid_record(pid), composition));
     let _ = connection.flush();
     let _ = connection.set_read_timeout(Some(REPLY_TIMEOUT));
     match bintel::read_document(&mut connection) {
-        Ok(document) => match bintel::parse_reply(&document) {
+        Ok(document) => match bintel::parse_reply(&document, composition) {
             Some(Reply::ExitStatus { code }) => code,
             _ => 1,
         },

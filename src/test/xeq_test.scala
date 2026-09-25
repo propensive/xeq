@@ -153,9 +153,11 @@ object Tests extends Suite(m"XEQ tests"):
         .assert(_ == (t"3764", t"ETHRCFG"))
 
     // The schema in `spec/ethereal-launcher.tel` is the contract, and `src/runner/src/bintel.rs`
-    // pins its signature as the constant the runner compares on the wire. Derive the one from
-    // the other, so that neither can change without the other: a schema edit that forgets the
-    // constant, or a constant edited by hand, fails here rather than at the first document.
+    // pins the hash of its base as the constant from which the runner derives every signature
+    // it writes and compares on the wire. Derive the one from the other, so that neither can
+    // change without the other: a schema edit that forgets the constant, or a constant edited
+    // by hand, fails here rather than at the first document. The base's hash is taken with the
+    // schema's layers removed (BinTEL §8.1), so adding a layer must leave it unchanged.
     suite(m"Launcher protocol"):
       import stratiform.*
       // Read from the jar this suite was loaded from: the host runner's classloader does
@@ -181,10 +183,10 @@ object Tests extends Suite(m"XEQ tests"):
 
       def derived: Text = hex(SchemaSignature.fromDocument(schemaText.read[Tel], Tels.Axiom.tels))
 
-      // The hex bytes of the `SIGNATURE` constant, in order.
+      // The hex bytes of the `BASE` constant, in order.
       def pinned: Text =
         val source: String = rust.s
-        val start = source.indexOf("pub const SIGNATURE")
+        val start = source.indexOf("pub const BASE")
         val end = source.indexOf("];", start)
         val builder = StringBuilder()
         var i = source.indexOf("0x", start)
@@ -193,9 +195,21 @@ object Tests extends Suite(m"XEQ tests"):
           i = source.indexOf("0x", i + 4)
         builder.toString.tt
 
-      test(m"the runner pins the signature of the schema in spec/"):
-        derived
+      // The runner writes the base's signature as the pinned hash followed by a trailer that
+      // makes every byte XOR to the cadence 0x79 (BinTEL §8.2); the same arithmetic, here,
+      // must reproduce what Stratiform derives, or the two sides' framing differs.
+      def runnerSignature: Text =
+        val hash = pinned.s.grouped(2).map(Integer.parseInt(_, 16)).toList
+        val trailer = hash.foldLeft(0x79)(_ ^ _) & 0xff
+        (hash :+ trailer).map { byte => String.format("%02x", Integer.valueOf(byte)) }.mkString.tt
+
+      test(m"the runner pins the hash of the base schema in spec/"):
+        derived.s.take(64).tt
       .check(_ == pinned)
+
+      test(m"the runner's palimpsest arithmetic reproduces the base signature"):
+        derived
+      .check(_ == runnerSignature)
 
       suite(m"build (native)"):
         test(m"output equals stub \u2016 record \u2016 jar, byte for byte"):

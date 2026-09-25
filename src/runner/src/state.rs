@@ -265,10 +265,19 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
-pub fn check_state(pid_file: &Path, build_file: &Path, socket_file: &Path, script: &Path) {
+pub fn check_state(
+    pid_file: &Path,
+    build_file: &Path,
+    socket_file: &Path,
+    script: &Path,
+    composition: &crate::bintel::Composition,
+) {
+    // The daemon's files, which mean nothing once it is gone: its socket, the launcher it
+    // recorded, and the acceptance it published (`acceptance` sits beside `build`).
     fn clear_daemon_files(build_file: &Path, socket_file: &Path) {
         let _ = fs::remove_file(build_file);
         let _ = fs::remove_file(socket_file);
+        if let Some(dir) = build_file.parent() { let _ = fs::remove_file(dir.join("acceptance")); }
     }
 
     let Some(pid) = read_pid(pid_file) else {
@@ -309,7 +318,7 @@ pub fn check_state(pid_file: &Path, build_file: &Path, socket_file: &Path, scrip
             std::thread::sleep(POLL_INTERVAL);
         }
 
-        Freshness::Verify => match crate::protocol::verify(socket_file) {
+        Freshness::Verify => match crate::protocol::verify(socket_file, composition) {
             // Metadata-only change, or the daemon predates the `v` message (its reply
             // is a closed connection, mapped to Fresh): connect as normal.
             crate::protocol::Verdict::Fresh => (),
