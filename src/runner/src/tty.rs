@@ -33,6 +33,35 @@ pub fn stdout_is_tty() -> bool { std::io::stdout().is_terminal() }
 
 pub fn stderr_is_tty() -> bool { std::io::stderr().is_terminal() }
 
+impl TtyState {
+    // The state of a terminal this launcher never reconfigured — a pipe, or a terminal it
+    // was not entitled to touch — so that restoring it is a no-op.
+    #[cfg(unix)]
+    pub fn detached() -> TtyState { TtyState { termios: None, is_tty: false } }
+
+    #[cfg(windows)]
+    pub fn detached() -> TtyState {
+        TtyState { stdin_mode: None, stdout_mode: None, is_tty: false }
+    }
+}
+
+// Whether this process may read and reconfigure the terminal on stdin: under job control,
+// only the foreground process group of the controlling terminal may, and a background job
+// that tried would be stopped by SIGTTIN or SIGTTOU. True when stdin is not a terminal —
+// there is then no terminal to be in the background of — and when the answer cannot be
+// determined, since the pre-existing behaviour is to proceed.
+#[cfg(unix)]
+pub fn in_foreground() -> bool {
+    if !stdin_is_tty() { return true; }
+    let terminal_group = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+    terminal_group < 0 || terminal_group == unsafe { libc::getpgrp() }
+}
+
+// Windows has no job control.
+#[cfg(windows)]
+pub fn in_foreground() -> bool { true }
+
+
 // The launcher must know the real terminal size so it can forward it to the
 // daemon (which only sees a socket and cannot query the tty itself). Querying
 // from the launcher avoids a fragile ANSI cursor-position handshake across

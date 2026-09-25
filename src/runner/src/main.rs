@@ -1,9 +1,10 @@
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod bintel;
@@ -42,22 +43,40 @@ use uds::UnixStream;
 
 const FORWARD_BUFFER_SIZE: usize = 4096;
 const TERMINATION_POLL: Duration = Duration::from_millis(50);
+// After a termination signal, how long the invocation's stderr is drained before the
+// launcher gives up on it and dies. The daemon closes the stderr connection when the
+// invocation ends, so this bounds only an invocation that accepted the signal and then
+// failed to act on it.
+const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const STARTUP_FAILURE_EXIT_CODE: i32 = 2;
-pub const WRAP_SENTINEL: &str = "{wrap-java}";
+
+// The launcher re-invokes itself with this variable set when starting the daemon, so the
+// JVM runs as a child of a process whose name matches the client (this binary *is* the
+// renamed launcher). A variable rather than an argument sentinel, so that no argument value
+// is reserved: the application may receive any argv at all.
+pub const WRAP_VARIABLE: &str = "XEQ_WRAP_JAVA";
+
+// Asks the launcher to download a JVM when none suitable is found. Recognised as an
+// environment variable, or as `--download` when it is the *sole* argument; in any other
+// position `--download` belongs to the application. See `spec/launcher.md`.
+pub const DOWNLOAD_VARIABLE: &str = "XEQ_DOWNLOAD";
+const DOWNLOAD_FLAG: &str = "--download";
+
+// Argument values the daemon side reserves for its own internal invocations (shell
+// completion and administration). They are the daemon's contract, not the launcher's; the
+// launcher only recognises them so as not to touch the terminal for an invocation that runs
+// behind the user's shell. See `spec/launcher.md`.
+const INTERNAL_SENTINELS: [&str; 2] = ["{completions}", "{admin}"];
 
 fn main() {
-    // The runner re-invokes itself with this sentinel as argv[1] when launching
-    // the daemon, so the JVM runs as a child of a process whose name matches the
-    // client (since this binary IS the renamed launcher). Dispatch before any
-    // other parsing — the wrapper has its own minimal argv contract.
-    let raw: Vec<String> = env::args().collect();
+    let raw: Vec<OsString> = env::args_os().collect();
     debug!("main: argv={:?}", raw);
-    if raw.get(1).is_some_and(|arg| arg == WRAP_SENTINEL) {
+    if env::var_os(WRAP_VARIABLE).is_some() {
         debug!("main: dispatching to wrapper");
-        wrapper::run(&raw[2..]);
+        wrapper::run(&raw[1..]);
     }
 
-    let (script, args, download) = parse_arguments();
+    let (script, args, download) = parse_arguments(raw);
     let name = script.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     debug!("main: script={} name={} args={:?}", script.display(), name, args);
     // This path is handed to the JVM as the JAR, and `update` renames it. A resolution that
@@ -84,12 +103,12 @@ fn main() {
     let progress_file = base_dir.join("progress");
     debug!("main: base_dir={}", base_dir.display());
 
-    // Non-interactive invocations (completions, admin) must not touch the TTY,
-    // fork a stdin-forwarding thread, or install signal handlers — doing so
-    // can steal input from the parent shell or trigger SIGTTOU when the
-    // process runs in a background process group (e.g. under `< <(...)`).
-    let interactive = !args.first().is_some_and(|arg| arg == "{completions}" || arg == "{admin}");
-    debug!("main: interactive={}", interactive);
+    // Internal invocations (completions, admin) must not touch the TTY, fork a
+    // stdin-forwarding thread, or install signal handlers — doing so can steal input from
+    // the parent shell or trigger SIGTTOU when the process runs in a background process
+    // group (e.g. under `< <(...)`).
+    let internal = args.first().is_some_and(|arg| INTERNAL_SENTINELS.iter().any(|s| arg == s));
+    debug!("main: internal={}", internal);
 
     state::backout(&fail_file, &pid_file, &name);
     state::check_state(&pid_file, &build_file, &socket_file, &script);
@@ -137,21 +156,34 @@ fn main() {
     }
     debug!("main: socket is alive");
 
-    if !interactive {
+    if internal {
         std::process::exit(run_non_interactive(&socket_file, &script, &args));
     }
 
-    let saved_tty = tty::save_tty_state();
-    tty::set_raw_mode();
+    // The terminal is ours to reconfigure only when stdin is a terminal *and* this process is
+    // in its foreground process group. A background job (`mytool > log &` under job control)
+    // that called tcsetattr or read the terminal would be stopped by SIGTTOU or SIGTTIN; it is
+    // treated instead as though its stdin were empty, and still forwards stdout and stderr.
+    let stdin_tty = tty::stdin_is_tty();
+    let foreground = tty::in_foreground();
+    let attached = stdin_tty && foreground;
+    debug!("main: stdin_tty={} foreground={} attached={}", stdin_tty, foreground, attached);
+
+    let saved_tty = if attached { tty::save_tty_state() } else { tty::TtyState::detached() };
+    if attached { tty::set_raw_mode(); }
 
     // Query the terminal's background colour while we still own stdin/stdout
     // directly. Anything the user happens to type during the handshake is
     // returned as `leftover` and chained ahead of stdin into the forwarder so
     // no bytes are lost.
-    let (bg_color, leftover) = tty::query_bg_color(Duration::from_millis(150));
+    let (bg_color, leftover) = if attached {
+        tty::query_bg_color(Duration::from_millis(150))
+    } else {
+        (None, Vec::new())
+    };
     debug!("main: bg_color={:?} leftover={}bytes", bg_color, leftover.len());
 
-    let info = ClientInfo::collect(&script, &args, tty::stdin_is_tty(), bg_color.as_deref());
+    let info = ClientInfo::collect(&script, &args, attached, bg_color.as_deref());
     debug!("main: connecting to daemon (pid={})", info.pid);
     let (main_socket, stderr_socket) = match connect_to_daemon(&socket_file, &info) {
         Ok(connections) => { debug!("main: connected to daemon"); connections },
@@ -164,9 +196,9 @@ fn main() {
 
     // The control channel lets the running command ask for a cooked (canonical) terminal —
     // ordinary echo and line editing — instead of the raw mode set above, and ask for raw
-    // mode back afterwards. Only opened for a real terminal: with a pipe there is nothing
-    // to switch, and the extra connection would be pure cost.
-    if tty::stdin_is_tty() {
+    // mode back afterwards. Only opened for a terminal we are entitled to reconfigure: with
+    // a pipe there is nothing to switch, and the extra connection would be pure cost.
+    if attached {
         match UnixStream::connect(&socket_file) {
             Ok(mut control) => {
                 protocol::send_control_request(&mut control, info.pid);
@@ -178,49 +210,74 @@ fn main() {
         }
     }
 
-    let stdin_reader = std::io::Cursor::new(leftover).chain(std::io::stdin());
-    spawn_forwarder(
-        stdin_reader,
-        main_socket.try_clone().expect("clone main socket"),
-        false,
-    );
+    // Stdin is forwarded from a foreground terminal or from anything that is not a terminal
+    // (a pipe, a file). A terminal we may not read — a background job — is presented to the
+    // daemon as already at end-of-file. Either way the write half of the connection is shut
+    // down once stdin is exhausted, which is how the invocation's stdin reaches EOF: dropping
+    // the forwarder's clone of the socket is not enough while other clones stay open.
+    let stdin_socket = main_socket.try_clone().expect("clone main socket");
+    if attached || !stdin_tty {
+        let stdin_reader = std::io::Cursor::new(leftover).chain(std::io::stdin());
+        spawn_stdin_forwarder(stdin_reader, stdin_socket);
+    } else {
+        let _ = stdin_socket.shutdown(Shutdown::Write);
+    }
     let stdout_thread = spawn_forwarder(
         main_socket.try_clone().expect("clone main socket"),
         std::io::stdout(),
         true,
     );
-    let stderr_thread = spawn_forwarder(stderr_socket, std::io::stderr(), true);
+    let stderr_thread = spawn_forwarder(
+        stderr_socket.try_clone().expect("clone stderr socket"),
+        std::io::stderr(),
+        true,
+    );
 
-    let termination_flag = Arc::new(AtomicBool::new(false));
-    signals::install(socket_file.clone(), info.pid, termination_flag.clone());
+    // Set to the terminating signal's number (or, on Windows, the exit code for the console
+    // event) once the daemon has accepted a termination the launcher must follow.
+    let termination = Arc::new(AtomicI32::new(0));
+    signals::install(socket_file.clone(), info.pid, termination.clone(), saved_tty, attached);
 
-    // When SIGTERM is flagged, shut down the main socket so the stdout
-    // forwarder unblocks immediately.
+    // When termination is flagged, shut down the main socket so the stdout forwarder
+    // unblocks at once, then bound the stderr drain: the daemon closes that connection when
+    // the invocation ends, but an invocation that accepted the signal and then ignored it
+    // must not keep the launcher alive.
     let socket_for_shutdown = main_socket.try_clone().expect("clone main socket");
-    let monitor_flag = termination_flag.clone();
+    let monitor_flag = termination.clone();
     std::thread::spawn(move || {
-        while !monitor_flag.load(Ordering::SeqCst) { std::thread::sleep(TERMINATION_POLL); }
-        let _ = socket_for_shutdown.shutdown(std::net::Shutdown::Both);
+        while monitor_flag.load(Ordering::SeqCst) == 0 { std::thread::sleep(TERMINATION_POLL); }
+        let _ = socket_for_shutdown.shutdown(Shutdown::Both);
+        std::thread::sleep(TERMINATION_GRACE);
+        let _ = stderr_socket.shutdown(Shutdown::Both);
     });
 
     let _ = stdout_thread.join();
     tty::restore_tty_state(&saved_tty);
-
-    if termination_flag.load(Ordering::SeqCst) { std::process::exit(1); }
     let _ = stderr_thread.join();
+
+    let signal = termination.load(Ordering::SeqCst);
+    if signal != 0 {
+        debug!("main: terminated by signal {}; dying by it", signal);
+        signals::die(signal);
+    }
     std::process::exit(protocol::terminate(&socket_file, info.pid));
 }
 
-fn parse_arguments() -> (PathBuf, Vec<String>, bool) {
-    let raw: Vec<String> = env::args().collect();
+fn parse_arguments(raw: Vec<OsString>) -> (PathBuf, Vec<OsString>, bool) {
     let executable = raw.first().cloned().unwrap_or_default();
-    let mut download = false;
-    let mut args: Vec<String> = Vec::with_capacity(raw.len().saturating_sub(1));
-    for arg in raw.iter().skip(1) {
-        if arg == "--download" { download = true; } else { args.push(arg.clone()); }
-    }
-    let script = resolve_script(&executable, std::env::current_exe().ok());
+    let (args, download) = intercept(&raw[raw.len().min(1)..]);
+    let script = resolve_script(&executable.to_string_lossy(), std::env::current_exe().ok());
     (strip_extended_prefix(script), args, download)
+}
+
+// The launcher's own arguments, separated from the application's. `--download` is a
+// launcher concern — it matters only when no JVM is present — so it is recognised only as
+// the sole argument, where it cannot be an application's option value or follow a `--`
+// separator. `XEQ_DOWNLOAD` in the environment asks for the same thing from a script.
+fn intercept(args: &[OsString]) -> (Vec<OsString>, bool) {
+    let requested = env::var_os(DOWNLOAD_VARIABLE).is_some_and(|v| !v.is_empty() && v != "0");
+    if args.len() == 1 && args[0] == DOWNLOAD_FLAG { (Vec::new(), true) }
+    else { (args.to_vec(), requested) }
 }
 
 // The file the runner hands the JVM is its OWN executable — stub, record and JAR are one file
@@ -288,6 +345,20 @@ fn spawn_forwarder(
     std::thread::spawn(move || forward(reader, writer, flush_each_chunk))
 }
 
+// The stdin direction: copy until stdin is exhausted, then half-close the connection so
+// the daemon's read of the invocation's stdin returns end-of-file while the other
+// direction — the invocation's stdout — stays open.
+fn spawn_stdin_forwarder(
+    reader: impl Read + Send + 'static,
+    socket: UnixStream,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        forward(reader, &socket, false);
+        debug!("main: stdin exhausted; half-closing");
+        let _ = socket.shutdown(Shutdown::Write);
+    })
+}
+
 // Apply terminal-mode commands from the daemon as they arrive. The thread ends when the
 // daemon closes the connection at client exit; the main path's `restore_tty_state` remains
 // the backstop for whatever mode we were left in.
@@ -320,7 +391,7 @@ fn forward(mut reader: impl Read, mut writer: impl Write, flush_each_chunk: bool
     let _ = writer.flush();
 }
 
-fn run_non_interactive(socket_file: &Path, script: &Path, args: &[String]) -> i32 {
+fn run_non_interactive(socket_file: &Path, script: &Path, args: &[OsString]) -> i32 {
     debug_log(format!(
         "run_non_interactive socket={} args={:?}", socket_file.display(), args,
     ));
@@ -334,6 +405,8 @@ fn run_non_interactive(socket_file: &Path, script: &Path, args: &[String]) -> i3
         }
     };
 
+    // Nothing is forwarded from stdin, so the invocation sees it at end-of-file at once.
+    let _ = main_socket.shutdown(Shutdown::Write);
     let stdout_thread = spawn_forwarder(main_socket, std::io::stdout(), true);
     let stderr_thread = spawn_forwarder(stderr_socket, std::io::stderr(), true);
 
@@ -347,9 +420,14 @@ fn run_non_interactive(socket_file: &Path, script: &Path, args: &[String]) -> i3
 }
 
 impl ClientInfo {
+    // Arguments, environment, working directory and script path cross the wire as UTF-8
+    // text (the protocol's scalars must be valid UTF-8), so a value that is not — a byte
+    // sequence that is not UTF-8 on Unix, an unpaired surrogate on Windows — is carried with
+    // U+FFFD in place of what could not be represented, exactly as the JVM itself would
+    // decode it. That is a documented loss, not a crash: see `spec/launcher.md`.
     pub fn collect(
         script: &Path,
-        args: &[String],
+        args: &[OsString],
         stdin_tty: bool,
         bg_color: Option<&str>,
     ) -> Self {
@@ -388,7 +466,7 @@ impl ClientInfo {
             pwd: env::current_dir()
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            args: args.to_vec(),
+            args: args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect(),
             env,
             // Whether stdin is a terminal is passed in rather than probed here: the
             // non-interactive path deliberately reports `false` even from a terminal, so
@@ -432,6 +510,30 @@ fn debug_log(message: impl AsRef<str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn os(values: &[&str]) -> Vec<OsString> { values.iter().map(OsString::from).collect() }
+
+    #[test]
+    fn download_is_recognised_only_as_the_sole_argument() {
+        // The variable is process-wide state; every case here leaves it unset.
+        unsafe { env::remove_var(DOWNLOAD_VARIABLE); }
+        assert_eq!(intercept(&os(&["--download"])), (Vec::new(), true));
+        assert_eq!(intercept(&os(&[])), (Vec::new(), false));
+        assert_eq!(intercept(&os(&["install", "--download"])), (os(&["install", "--download"]), false));
+        assert_eq!(intercept(&os(&["--download", "install"])), (os(&["--download", "install"]), false));
+        assert_eq!(intercept(&os(&["--", "--download"])), (os(&["--", "--download"]), false));
+    }
+
+    #[test]
+    fn internal_sentinels_are_only_the_first_argument() {
+        let internal = |args: &[&str]| {
+            os(args).first().is_some_and(|arg| INTERNAL_SENTINELS.iter().any(|s| arg == s))
+        };
+        assert!(internal(&["{completions}", "zsh"]));
+        assert!(internal(&["{admin}"]));
+        assert!(!internal(&["run", "{admin}"]));
+        assert!(!internal(&[]));
+    }
 
     #[test]
     fn a_bare_name_is_not_a_path_but_anything_with_a_separator_is() {
@@ -483,5 +585,14 @@ mod tests {
     fn an_unresolvable_argv0_is_returned_unchanged() {
         let missing = "xeq-no-such-command-9f3a1c";
         assert_eq!(resolve_script(missing, None), PathBuf::from(missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn arguments_that_are_not_utf8_are_carried_lossily_rather_than_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+        let args = vec![OsString::from_vec(vec![b'a', 0xff, b'b'])];
+        let info = ClientInfo::collect(Path::new("/x"), &args, false, None);
+        assert_eq!(info.args, vec!["a\u{fffd}b".to_string()]);
     }
 }

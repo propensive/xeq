@@ -47,9 +47,11 @@ pub fn launch(
     // Re-invoke ourselves in wrapper mode so the daemon process appears under
     // the client's name (the launcher binary is this runner with the JAR
     // appended). The wrapper exec's java synchronously and forwards signals.
+    // The mode is selected by an environment variable, not an argument, so
+    // that the application's own argv has no reserved values.
     let executable = std::env::current_exe().unwrap_or_else(|_| script.to_path_buf());
     let mut command = Command::new(&executable);
-    command.arg(crate::WRAP_SENTINEL).arg(&java);
+    command.env(crate::WRAP_VARIABLE, "1").arg(&java);
     for argument in build_java_arguments(script, name, progress_file, config) { command.arg(argument); }
     // Capture the JVM invocation time as late as possible — after the slow
     // argument-building work (zsh probe, $fpath capture) — so `uptime` in the
